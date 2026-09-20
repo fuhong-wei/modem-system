@@ -111,7 +111,7 @@ class ReliableUDPTransfer:
 
             self._reset_state()
             sent_chunks = 0
-            acked_chunks = set()
+            acked_chunks: set = set()
             window_start = 0
             last_ack_time = time.time()
             start_time = time.time()
@@ -296,7 +296,7 @@ class ReliableUDPTransfer:
 
             receiver_modulation_type = "BPSK"
             receiver_coding_scheme = "重复编码"
-            receiver_snr_db = 10
+            receiver_snr_db = 10.0
 
             self.on_progress(0, 1)
             self._reset_state()
@@ -309,7 +309,6 @@ class ReliableUDPTransfer:
                     if data.startswith(b"FILE_INFO"):
                         info_parts = data.decode().split("|")
                         filename = info_parts[1]
-                        file_size = int(info_parts[2])
                         total_chunks = int(info_parts[3])
 
                         if len(info_parts) >= 7:

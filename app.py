@@ -152,10 +152,10 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
                 f"编码={received_data['coding_scheme']}, 信噪比={received_data['snr_db']}dB"
             )
         else:
-            st.write(f"- 对比比特数: 无接收数据")
-            st.write(f"- 错误比特数: N/A")
-            st.write(f"- 实际误码率: N/A")
-            st.write(f"- 数据一致性: N/A")
+            st.write("- 对比比特数: 无接收数据")
+            st.write("- 错误比特数: N/A")
+            st.write("- 实际误码率: N/A")
+            st.write("- 数据一致性: N/A")
 
             actual_ber = None
             actual_errors = 0
@@ -904,11 +904,11 @@ def main() -> None:
                     st.write(f"- 正确率: {(1 - results['actual_ber']) * 100:.6f}%")
                     st.write(f"- 数据一致性: {'✅ 完全一致' if results['data_consistent'] else '❌ 不一致'}")
                 else:
-                    st.write(f"- 对比比特数: N/A")
-                    st.write(f"- 错误比特数: N/A")
-                    st.write(f"- 误码率: N/A")
-                    st.write(f"- 正确率: N/A")
-                    st.write(f"- 数据一致性: N/A")
+                    st.write("- 对比比特数: N/A")
+                    st.write("- 错误比特数: N/A")
+                    st.write("- 误码率: N/A")
+                    st.write("- 正确率: N/A")
+                    st.write("- 数据一致性: N/A")
 
             with col_stat2:
                 st.write("**🔴 模拟信道统计**")

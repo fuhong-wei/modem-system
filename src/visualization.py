@@ -1,11 +1,13 @@
 """信号可视化模块（纯绘图，不依赖 UI）。"""
 
+from typing import Optional
+
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy import signal as scipy_signal
 
 
-def plot_constellation(signal, title: str = "星座图", ax=None, modulation_type: str = None):
+def plot_constellation(signal, title: str = "星座图", ax=None, modulation_type: Optional[str] = None):
     """绘制星座图。"""
     if ax is None:
         _fig, ax = plt.subplots(figsize=(6, 6))
