@@ -4,6 +4,16 @@
 
 基于 [Streamlit](https://streamlit.io/) 的交互式通信系统，实现了基于 UDP 的可靠文件传输、数字调制解调（BPSK/QPSK）、信道编码（重复编码 / 汉明编码）与误码率（BER）分析。
 
+## 技术栈
+
+| 类别 | 技术 |
+| --- | --- |
+| 语言 | Python 3.10+ |
+| 界面 | Streamlit |
+| 科学计算 | NumPy、SciPy、Matplotlib |
+| 测试 / 规范 | pytest、pytest-cov、ruff、mypy |
+| CI/CD | GitHub Actions |
+
 ## 功能特性
 
 - **调制解调**：BPSK / QPSK 调制与解调
@@ -60,15 +70,21 @@ graph TB
 
 ## 环境要求
 
-- Python 3.8+
+- Python 3.10+
 
 ## 安装
 
+建议使用虚拟环境：
+
 ```bash
-# 安装运行时依赖
+# 1. 创建并激活虚拟环境
+python -m venv venv
+source venv/bin/activate      # Windows: venv\Scripts\activate
+
+# 2. 安装运行时依赖
 pip install -r requirements.txt
 
-# 安装开发依赖（测试与代码检查）
+# 3.（可选）安装开发依赖（测试与代码检查）
 pip install -r requirements-dev.txt
 ```
 
@@ -78,9 +94,20 @@ pip install -r requirements-dev.txt
 streamlit run app.py
 ```
 
-1. **发送文件**：设置目标 IP 与端口，选择文件并发送
-2. **接收文件**：在接收端监听对应端口
-3. **误码率分析**：调整调制方式、编码方案与信噪比，观察误码率与信号波形
+**传输流程**（发送端与接收端可分别运行；演示时请先在接收端监听）：
+
+1. **接收文件**：在接收端页签点「开始监听」（默认端口 8888）
+2. **发送文件**：在发送端设置目标 IP 与端口，选择文件并点「开始发送」
+3. **误码率分析**：切换页签，调整调制方式、编码方案与信噪比，观察误码率与信号波形
+
+## 运行截图
+
+> 待补充。运行 `streamlit run app.py` 后，可将界面截图放入 `docs/screenshots/` 目录，然后在下方用 `![说明](docs/screenshots/xxx.png)` 引用。
+
+<!--
+![发送文件](docs/screenshots/send.png)
+![误码率分析](docs/screenshots/ber.png)
+-->
 
 ## 测试与代码质量
 
