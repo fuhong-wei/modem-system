@@ -5,7 +5,6 @@
 
 import glob
 import os
-import random
 import threading
 import time
 
@@ -116,12 +115,19 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
         st.info(f"开始误码率分析: 发送数据{len(original_bits)}比特")
         st.write(f"模拟参数: 调制={modulation_type}, 编码={coding_scheme}, 信噪比={snr_db}dB")
 
-        # 1. 完整信道模拟
+        # 1. 完整信道模拟（封顶 64KB，避免大文件 OOM；实际误码率用完整采样）
+        simulated_max_bits = 64 * 1024 * 8
+        sim_bits = original_bits[:simulated_max_bits]
         simulation_results = transfer.modem.simulate_complete_channel(
-            original_bits, modulation_type, coding_scheme, snr_db
+            sim_bits, modulation_type, coding_scheme, snr_db
         )
-        # 把原始比特一并放进结果，供可视化做「原始比特 vs 解码比特」的对比
-        simulation_results["original_bits"] = original_bits
+        # 把模拟用的原始比特放进结果，供可视化做「原始比特 vs 解码比特」的对比
+        simulation_results["original_bits"] = sim_bits
+        if len(original_bits) > simulated_max_bits:
+            st.info(
+                f"⚠️ 模拟信道分析封顶为前 64KB（{simulated_max_bits:,} 比特），"
+                f"实际误码率仍对比完整 {len(original_bits):,} 比特。"
+            )
         for step in simulation_results.get("steps", []):
             st.write(step)
 
@@ -167,6 +173,7 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
             received_bits_sample = []
 
         # 3. 保存分析结果
+        recv_record = st.session_state.get("received_data") or {}
         st.session_state.ber_analysis_results = {
             "actual_ber": actual_ber,
             "actual_errors": actual_errors,
@@ -181,6 +188,13 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
             "sent_filename": sent_data["filename"],
             "received_filename": received_filename,
             "file_size": sent_data["file_size"],
+            "analyzed_bytes": sent_data.get("analyzed_bytes"),
+            "duration": sent_data.get("duration"),
+            "speed": sent_data.get("speed"),
+            "retransmissions": sent_data.get("retransmissions"),
+            "total_chunks": sent_data.get("total_chunks"),
+            "recv_completion_ratio": recv_record.get("completion_ratio"),
+            "recv_missing_chunks": recv_record.get("missing_chunks"),
             "coding_rate": transfer.modem.coding_rate,
             "original_bits_count": len(original_bits),
             "encoded_bits_count": len(simulation_results["encoded_bits"]),
@@ -493,7 +507,7 @@ def display_signal_visualization_enhanced(
 # 接收端实时面板
 # ---------------------------------------------------------------------------
 @st.fragment(run_every="1s")
-def _render_receiver_panel(transfer: ReliableUDPTransfer, monitor_quality: bool, snr_db: float) -> None:
+def _render_receiver_panel(transfer: ReliableUDPTransfer, monitor_quality: bool) -> None:
     """接收端实时面板：监听状态、端口切换提示、错误、进度与日志（每秒自动刷新）。"""
     events = transfer.drain_receiver_events()
 
@@ -528,25 +542,28 @@ def _render_receiver_panel(transfer: ReliableUDPTransfer, monitor_quality: bool,
                 )
                 show(text)
 
-    # 信道质量监控（演示数据）
+    # 信道质量（真实统计，来自最近一次接收记录）
     if transfer.receiver_alive and monitor_quality:
-        st.subheader("📡 实际信道质量监控")
-        col_qual1, col_qual2, col_qual3 = st.columns(3)
-        with col_qual1:
-            actual_snr = snr_db + random.uniform(-2, 2)
-            st.metric("估计实际信噪比", f"{actual_snr:.1f} dB")
-        with col_qual2:
-            packet_loss = random.uniform(0, 5)
-            st.metric("估计包丢失率", f"{packet_loss:.2f}%")
-        with col_qual3:
-            latency = random.uniform(10, 100)
-            st.metric("估计网络延迟", f"{latency:.1f} ms")
-        st.info("""
-        **说明:**
-        - 实际信道质量基于当前网络环境和系统参数估计
-        - 这些值会因网络状况实时变化
-        - 用于与模拟信道参数对比参考
-        """)
+        st.subheader("📡 实际信道质量（最近一次传输）")
+        received = st.session_state.get("received_data") or {}
+        total_chunks = received.get("total_chunks")
+        if total_chunks:
+            completion = received.get("completion_ratio") or 0
+            missing = received.get("missing_chunks") or 0
+            recv_loss = missing / total_chunks * 100
+            speed = received.get("speed")
+            duration = received.get("duration")
+            col_qual1, col_qual2, col_qual3 = st.columns(3)
+            with col_qual1:
+                st.metric("接收端完整度", f"{completion:.1%}")
+            with col_qual2:
+                st.metric("接收端丢包率", f"{recv_loss:.2f}%")
+            with col_qual3:
+                st.metric("平均速度", f"{speed:.2f} MB/s" if speed is not None else "N/A")
+            if duration is not None:
+                st.caption(f"传输耗时 {duration:.2f} 秒，共 {total_chunks} 块，缺失 {missing} 块")
+        else:
+            st.info("等待首次传输完成… 接收成功后这里会显示真实的完整度 / 丢包率 / 速度。")
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +634,14 @@ def main() -> None:
         "超时时间(秒)", min_value=1, max_value=10, value=3,
         help="等待确认的超时时间，影响响应性",
     )
+
+    sample_size_label = st.sidebar.selectbox(
+        "分析采样大小", ["1KB", "64KB", "1MB", "整个文件"], index=1,
+        help="误码率分析取多少字节数据；越大越能区分不同文件，但模拟信道分析会封顶 64KB",
+    )
+    transfer.sample_size = {
+        "1KB": 1024, "64KB": 64 * 1024, "1MB": 1024 * 1024, "整个文件": None,
+    }[sample_size_label]
 
     if coding_scheme == "重复编码":
         transfer.modem.coding_rate = 1 / 3
@@ -696,6 +721,9 @@ def main() -> None:
                     )
                     if record:
                         st.session_state.sent_data = record
+                        # 清空旧接收数据与分析结果，避免「新发送 vs 旧接收」跨文件对比
+                        st.session_state.pop("received_data", None)
+                        st.session_state.ber_analysis_results = None
                         st.balloons()
                         st.success("✅ 文件发送成功完成!")
                     else:
@@ -756,7 +784,7 @@ def main() -> None:
             st.session_state.ber_analysis_needed = True
 
         # 接收端实时面板：状态 / 端口切换 / 错误 / 进度 / 日志（每秒自动刷新）
-        _render_receiver_panel(transfer, monitor_quality, snr_db)
+        _render_receiver_panel(transfer, monitor_quality)
 
         # 文件管理
         st.subheader("🗂️ 文件管理")
@@ -897,6 +925,34 @@ def main() -> None:
                 st.write(f"**编码效率**: {results['coding_rate']:.3f}")
                 st.write(f"**设定信噪比**: {results['snr_db']} dB")
                 st.write(f"**实际信噪比**: {results.get('actual_snr', 'N/A'):.2f} dB")
+
+            st.subheader("⚡ 本次传输性能")
+            analyzed_bytes = results.get("analyzed_bytes")
+            analyzed_bits = results.get("original_bits_count")
+            duration = results.get("duration")
+            speed = results.get("speed")
+            retransmissions = results.get("retransmissions")
+            total_chunks = results.get("total_chunks")
+            recv_completion = results.get("recv_completion_ratio")
+            recv_missing = results.get("recv_missing_chunks")
+            sent_loss = (retransmissions / total_chunks * 100) if (retransmissions is not None and total_chunks) else None
+            recv_loss = (recv_missing / total_chunks * 100) if (recv_missing is not None and total_chunks) else None
+
+            col_perf1, col_perf2, col_perf3 = st.columns(3)
+            with col_perf1:
+                st.metric("分析范围", f"{analyzed_bytes / 1024:.1f} KB" if analyzed_bytes else "N/A",
+                          help=f"实际误码率对比 {analyzed_bits:,} 比特；模拟信道分析封顶 64KB")
+                st.metric("传输耗时", f"{duration:.2f} 秒" if duration is not None else "N/A")
+            with col_perf2:
+                st.metric("平均速度", f"{speed:.2f} MB/s" if speed is not None else "N/A")
+                st.metric("重传次数", f"{retransmissions}" if retransmissions is not None else "N/A")
+            with col_perf3:
+                st.metric("发送端丢包率", f"{sent_loss:.2f}%" if sent_loss is not None else "N/A",
+                          help="重传次数 / 总块数（近似）")
+                st.metric("接收端丢包率", f"{recv_loss:.2f}%" if recv_loss is not None else "N/A",
+                          help="缺失块数 / 总块数")
+            if recv_completion is not None:
+                st.caption(f"接收端完整度：{recv_completion:.1%}（收到 {int(recv_completion * (total_chunks or 0))}/{total_chunks} 块）")
 
             st.subheader("🎯 误码率对比分析")
             col_ber1, col_ber2 = st.columns(2)

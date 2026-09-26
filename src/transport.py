@@ -38,6 +38,7 @@ class ReliableUDPTransfer:
         self.window_size = 8
         self.modem = ModemSystem()
         self.ack_timeout = 0.5
+        self.sample_size = 64 * 1024  # 误码率分析的采样字节数；None 表示整个文件
 
         self.on_message = on_message or (lambda level, text: None)
         self.on_progress = on_progress or (lambda done, total: None)
@@ -276,10 +277,18 @@ class ReliableUDPTransfer:
 
             total_time = time.time() - start_time
             total_speed = (file_size / 1024 / 1024) / total_time if total_time > 0 else 0
-            self.on_message("success", f"文件发送完成! 总时间: {total_time:.2f}秒, 平均速度: {total_speed:.2f} MB/s")
+            total_retransmissions = sum(self._retry_count.values())
+            self.on_message(
+                "success",
+                f"文件发送完成! 总时间: {total_time:.2f}秒, 平均速度: {total_speed:.2f} MB/s, 重传 {total_retransmissions} 次",
+            )
             sock.close()
 
-            return self.save_transmission_data(file_data, filename, "sent", modulation_type, coding_scheme, snr_db)
+            return self.save_transmission_data(
+                file_data, filename, "sent", modulation_type, coding_scheme, snr_db,
+                duration=total_time, speed=total_speed, retransmissions=total_retransmissions,
+                total_chunks=total_chunks,
+            )
 
         except Exception as e:
             self.on_message("error", f"发送失败: {str(e)}")
@@ -294,23 +303,39 @@ class ReliableUDPTransfer:
         modulation_type: Optional[str] = None,
         coding_scheme: Optional[str] = None,
         snr_db: Optional[float] = None,
+        duration: Optional[float] = None,
+        speed: Optional[float] = None,
+        retransmissions: Optional[int] = None,
+        total_chunks: Optional[int] = None,
+        completion_ratio: Optional[float] = None,
+        missing_chunks: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """保存传输数据（前 1000 字节），返回数据记录，并备份到临时文件。"""
+        """保存传输数据（按 ``sample_size`` 采样），返回数据记录，并备份到临时文件。
+
+        ``duration / speed / retransmissions`` 等为传输性能指标，供误码率分析页展示。
+        """
         modulation_type = modulation_type or self.modem.modulation_type
         coding_scheme = coding_scheme or "重复编码"
         snr_db = snr_db if snr_db is not None else self.modem.snr_db
 
-        sample_data = file_data[:1000] if len(file_data) > 1000 else file_data
+        sample_data = file_data if self.sample_size is None else file_data[:self.sample_size]
         bits = self.bytes_to_bits(sample_data)
 
         record = {
             "original_bits": bits,
             "filename": filename,
             "file_size": len(file_data),
+            "analyzed_bytes": len(sample_data),
             "timestamp": time.time(),
             "modulation_type": modulation_type,
             "coding_scheme": coding_scheme,
             "snr_db": snr_db,
+            "duration": duration,
+            "speed": speed,
+            "retransmissions": retransmissions,
+            "total_chunks": total_chunks,
+            "completion_ratio": completion_ratio,
+            "missing_chunks": missing_chunks,
         }
 
         try:
@@ -345,10 +370,18 @@ class ReliableUDPTransfer:
                 "original_bits": bits,
                 "filename": filename,
                 "file_size": len(file_data),
+                "analyzed_bytes": len(file_data),
                 "timestamp": os.path.getmtime(latest_file),
                 "modulation_type": self.modem.modulation_type,
                 "coding_scheme": "重复编码",
                 "snr_db": self.modem.snr_db,
+                # 性能指标未持久化到 .dat 文件，从文件恢复时置 None
+                "duration": None,
+                "speed": None,
+                "retransmissions": None,
+                "total_chunks": None,
+                "completion_ratio": None,
+                "missing_chunks": None,
             }
         except Exception as e:
             self.on_message("error", f"从文件加载数据错误: {e}")
@@ -543,6 +576,8 @@ class ReliableUDPTransfer:
             return self.save_transmission_data(
                 file_data, filename, "received",
                 receiver_modulation_type, receiver_coding_scheme, receiver_snr_db,
+                duration=elapsed, speed=speed, total_chunks=total_chunks,
+                completion_ratio=completion_ratio, missing_chunks=len(missing_chunks),
             )
 
         except Exception as e:
