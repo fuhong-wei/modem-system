@@ -120,6 +120,8 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
         simulation_results = transfer.modem.simulate_complete_channel(
             original_bits, modulation_type, coding_scheme, snr_db
         )
+        # 把原始比特一并放进结果，供可视化做「原始比特 vs 解码比特」的对比
+        simulation_results["original_bits"] = original_bits
         for step in simulation_results.get("steps", []):
             st.write(step)
 
@@ -315,35 +317,34 @@ def display_signal_visualization_enhanced(
             plot_spectrum(simulation_results["modulated_signal"][:2000], title="调制信号频谱", ax=ax1, fs=1000)
             plot_spectrum(simulation_results["noisy_signal"][:2000], title="加噪信号频谱", ax=ax2, fs=1000)
 
-            if np.iscomplexobj(simulation_results["modulated_signal"]):
-                fft_mod = np.fft.fft(simulation_results["modulated_signal"][:2000])
-                fft_noisy = np.fft.fft(simulation_results["noisy_signal"][:2000])
-                freq = np.fft.fftfreq(2000, 1 / 1000)
+            fft_mod = np.fft.fft(simulation_results["modulated_signal"][:2000])
+            fft_noisy = np.fft.fft(simulation_results["noisy_signal"][:2000])
+            freq = np.fft.fftfreq(2000, 1 / 1000)
 
-                positive_freq = freq[:1000]
-                positive_fft_mod = np.abs(fft_mod[:1000])
-                positive_fft_noisy = np.abs(fft_noisy[:1000])
+            positive_freq = freq[:1000]
+            positive_fft_mod = np.abs(fft_mod[:1000])
+            positive_fft_noisy = np.abs(fft_noisy[:1000])
 
-                ax3.plot(positive_freq, 20 * np.log10(positive_fft_mod + 1e-10),
-                         "b-", alpha=0.7, label="调制信号", linewidth=1)
-                ax3.plot(positive_freq, 20 * np.log10(positive_fft_noisy + 1e-10),
-                         "r-", alpha=0.5, label="加噪信号", linewidth=1)
-                ax3.set_xlabel("频率 (Hz)")
-                ax3.set_ylabel("幅度 (dB)")
-                ax3.set_title("频谱对比")
-                ax3.legend()
-                ax3.grid(True, alpha=0.3)
-                ax3.set_xlim([0, 500])
+            ax3.plot(positive_freq, 20 * np.log10(positive_fft_mod + 1e-10),
+                     "b-", alpha=0.7, label="原始信号", linewidth=1)
+            ax3.plot(positive_freq, 20 * np.log10(positive_fft_noisy + 1e-10),
+                     "r-", alpha=0.5, label="加噪信号", linewidth=1)
+            ax3.set_xlabel("频率 (Hz)")
+            ax3.set_ylabel("幅度 (dB)")
+            ax3.set_title("频谱对比")
+            ax3.legend()
+            ax3.grid(True, alpha=0.3)
+            ax3.set_xlim([0, 500])
 
-                noise_estimate = positive_fft_noisy - positive_fft_mod
-                ax4.plot(positive_freq, 20 * np.log10(np.abs(noise_estimate) + 1e-10),
-                         "g-", alpha=0.7, label="估计噪声", linewidth=1)
-                ax4.set_xlabel("频率 (Hz)")
-                ax4.set_ylabel("噪声幅度 (dB)")
-                ax4.set_title("噪声频谱估计")
-                ax4.legend()
-                ax4.grid(True, alpha=0.3)
-                ax4.set_xlim([0, 500])
+            noise_estimate = positive_fft_noisy - positive_fft_mod
+            ax4.plot(positive_freq, 20 * np.log10(np.abs(noise_estimate) + 1e-10),
+                     "g-", alpha=0.7, label="估计噪声", linewidth=1)
+            ax4.set_xlabel("频率 (Hz)")
+            ax4.set_ylabel("噪声幅度 (dB)")
+            ax4.set_title("噪声频谱估计")
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+            ax4.set_xlim([0, 500])
 
             plt.tight_layout()
             st.pyplot(fig)
@@ -365,35 +366,38 @@ def display_signal_visualization_enhanced(
             try:
                 plot_spectrogram(
                     simulation_results["modulated_signal"][:4000],
-                    title="调制信号频谱瀑布图", ax=ax1, fs=1000, nperseg=256,
+                    title="调制信号时频图（Spectrogram）", ax=ax1, fs=1000, nperseg=256,
                 )
             except Exception as e:
-                ax1.text(0.5, 0.5, f"频谱瀑布图生成失败: {str(e)}",
+                ax1.text(0.5, 0.5, f"时频图生成失败: {str(e)}",
                          ha="center", va="center", transform=ax1.transAxes)
-                ax1.set_title("调制信号频谱瀑布图")
+                ax1.set_title("调制信号时频图（Spectrogram）")
 
             try:
                 plot_spectrogram(
                     simulation_results["noisy_signal"][:4000],
-                    title="加噪信号频谱瀑布图", ax=ax2, fs=1000, nperseg=256,
+                    title="加噪信号时频图（Spectrogram）", ax=ax2, fs=1000, nperseg=256,
                 )
             except Exception as e:
-                ax2.text(0.5, 0.5, f"频谱瀑布图生成失败: {str(e)}",
+                ax2.text(0.5, 0.5, f"时频图生成失败: {str(e)}",
                          ha="center", va="center", transform=ax2.transAxes)
-                ax2.set_title("加噪信号频谱瀑布图")
+                ax2.set_title("加噪信号时频图（Spectrogram）")
 
             plt.tight_layout()
             st.pyplot(fig)
 
             st.subheader("⏱️ 时域波形对比")
-            fig2, (ax3, ax4) = plt.subplots(2, 1, figsize=(14, 8))
+            fig2, (ax3, ax4, ax5) = plt.subplots(3, 1, figsize=(14, 10))
 
             display_length = min(200, len(simulation_results["modulated_signal"]))
             time_axis = np.arange(display_length)
 
-            ax3.plot(time_axis, np.real(simulation_results["modulated_signal"][:display_length]),
-                     "b-", label="调制信号(实部)", linewidth=1.5, alpha=0.8)
-            ax3.plot(time_axis, np.real(simulation_results["noisy_signal"][:display_length]),
+            mod_signal = simulation_results["modulated_signal"][:display_length]
+            noisy_signal = simulation_results["noisy_signal"][:display_length]
+
+            ax3.plot(time_axis, np.real(mod_signal),
+                     "b-", label="原始信号(实部)", linewidth=1.5, alpha=0.8)
+            ax3.plot(time_axis, np.real(noisy_signal),
                      "r-", label="加噪信号(实部)", linewidth=1, alpha=0.6)
             ax3.set_xlabel("时间")
             ax3.set_ylabel("幅度")
@@ -401,43 +405,55 @@ def display_signal_visualization_enhanced(
             ax3.legend()
             ax3.grid(True, alpha=0.3)
 
-            if np.iscomplexobj(simulation_results["modulated_signal"]):
-                ax4.plot(time_axis, np.imag(simulation_results["modulated_signal"][:display_length]),
-                         "g-", label="调制信号(虚部)", linewidth=1.5, alpha=0.8)
-                ax4.plot(time_axis, np.imag(simulation_results["noisy_signal"][:display_length]),
+            if np.iscomplexobj(mod_signal):
+                ax4.plot(time_axis, np.imag(mod_signal),
+                         "g-", label="原始信号(虚部)", linewidth=1.5, alpha=0.8)
+                ax4.plot(time_axis, np.imag(noisy_signal),
                          "orange", label="加噪信号(虚部)", linewidth=1, alpha=0.6)
                 ax4.set_xlabel("时间")
                 ax4.set_ylabel("幅度")
                 ax4.set_title("信号虚部对比")
             else:
-                ax4.plot(time_axis, np.abs(simulation_results["modulated_signal"][:display_length]),
-                         color="purple", linestyle="-", label="调制信号幅度", linewidth=1.5, alpha=0.8)
-                ax4.plot(time_axis, np.abs(simulation_results["noisy_signal"][:display_length]),
+                ax4.plot(time_axis, np.abs(mod_signal),
+                         color="purple", linestyle="-", label="原始信号幅度", linewidth=1.5, alpha=0.8)
+                ax4.plot(time_axis, np.abs(noisy_signal),
                          color="brown", linestyle="-", label="加噪信号幅度", linewidth=1, alpha=0.6)
                 ax4.set_xlabel("时间")
                 ax4.set_ylabel("幅度")
                 ax4.set_title("信号幅度对比")
-
             ax4.legend()
             ax4.grid(True, alpha=0.3)
+
+            # 噪声分量：直接画出加噪与原始的差值，让差异一目了然
+            noise_signal = noisy_signal - mod_signal
+            ax5.plot(time_axis, np.real(noise_signal),
+                     color="red", label="噪声分量(实部)", linewidth=1, alpha=0.7)
+            if np.iscomplexobj(noise_signal):
+                ax5.plot(time_axis, np.imag(noise_signal),
+                         color="orange", label="噪声分量(虚部)", linewidth=1, alpha=0.7)
+            ax5.set_xlabel("时间")
+            ax5.set_ylabel("幅度")
+            ax5.set_title("噪声分量（加噪信号 − 原始信号）")
+            ax5.legend()
+            ax5.grid(True, alpha=0.3)
 
             plt.tight_layout()
             st.pyplot(fig2)
 
             st.info("""
             **综合视图分析说明:**
-            - 🌊 **频谱瀑布图**: 展示信号频率随时间的变化，反映信号的时频特性
+            - 🌊 **时频图（Spectrogram）**: 展示信号频率随时间的变化，反映信号的时频特性
             - ⏱️ **时域波形**: 展示信号幅度随时间的变化
             - 🔄 **实部/虚部**: 对于复信号，分别展示同相分量和正交分量
             - 📈 **信号变化**: 观察信号在传输过程中的畸变和失真
-            - 🎨 **颜色映射**: 频谱瀑布图中颜色深浅表示信号强度
+            - 🎨 **颜色映射**: 时频图中颜色深浅表示信号强度
             """)
 
         # 比特错误可视化
         st.subheader("🔍 比特错误分析")
 
-        display_bits = min(50, len(simulation_results["decoded_bits"]))
-        original_display = simulation_results["decoded_bits"][:display_bits]
+        display_bits = min(50, len(simulation_results["original_bits"]), len(simulation_results["decoded_bits"]))
+        original_display = simulation_results["original_bits"][:display_bits]
         simulated_display = simulation_results["decoded_bits"][:display_bits]
 
         fig3, ax = plt.subplots(figsize=(15, 4))
