@@ -8,8 +8,9 @@ import logging
 import os
 import socket
 import struct
+import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -44,6 +45,69 @@ class ReliableUDPTransfer:
 
         self._sent_time: Dict[int, float] = {}
         self._retry_count: Dict[int, int] = {}
+
+        # 接收端生命周期控制（供 UI 停止监听 / 显示实时状态）
+        self._receiver_stop = threading.Event()
+        self._receiver_socket: Optional[socket.socket] = None
+        self._receiver_alive = threading.Event()
+        self._receiver_generation = 0
+        self._receiver_thread_ident: Optional[int] = None
+
+        # 接收线程运行状态（线程安全，供 UI 主线程读取）
+        self.receiver_error: Optional[str] = None
+        self.receiver_actual_port: Optional[int] = None
+        self.last_received_record: Optional[Dict[str, Any]] = None
+
+        # 后台接收线程的消息/进度/状态缓冲（避免后台线程直接调用 st.*）
+        self._receiver_lock = threading.Lock()
+        self._receiver_messages: List[Tuple[str, str]] = []
+        self._receiver_progress: Tuple[int, int] = (0, 0)
+        self._receiver_status = ""
+
+    @property
+    def receiver_alive(self) -> bool:
+        """接收端是否正在监听（线程安全，由接收线程 + generation 兜底维护）。"""
+        return self._receiver_alive.is_set()
+
+    # ---------- 接收线程事件缓冲（后台线程写入，UI 主线程读取） ----------
+    def _receiver_log(self, level: str, text: str) -> None:
+        with self._receiver_lock:
+            self._receiver_messages.append((level, text))
+
+    def _receiver_update_progress(self, done: int, total: int) -> None:
+        with self._receiver_lock:
+            self._receiver_progress = (done, total)
+
+    def _receiver_update_status(self, text: str) -> None:
+        with self._receiver_lock:
+            self._receiver_status = text
+
+    def _notify(self, level: str, text: str) -> None:
+        """统一消息出口：接收线程写入缓冲，其余线程直接回调（避免后台线程调 st.*）。"""
+        if threading.get_ident() == self._receiver_thread_ident:
+            self._receiver_log(level, text)
+        else:
+            self.on_message(level, text)
+
+    def drain_receiver_events(self) -> Dict[str, Any]:
+        """取出并清空接收线程缓冲的消息/进度/状态（UI 主线程调用）。"""
+        with self._receiver_lock:
+            messages = self._receiver_messages[:]
+            self._receiver_messages.clear()
+            progress = self._receiver_progress
+            status = self._receiver_status
+        return {"messages": messages, "progress": progress, "status": status}
+
+    def set_last_received_record(self, record: Optional[Dict[str, Any]]) -> None:
+        """接收线程把结果记录交给 UI 主线程（线程安全）。"""
+        with self._receiver_lock:
+            self.last_received_record = record
+
+    def take_last_received_record(self) -> Optional[Dict[str, Any]]:
+        with self._receiver_lock:
+            record = self.last_received_record
+            self.last_received_record = None
+        return record
 
     # ---------- 字节 <-> 比特 ----------
     @staticmethod
@@ -83,6 +147,7 @@ class ReliableUDPTransfer:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(self.ack_timeout)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
 
             file_info = (
                 f"FILE_INFO|{filename}|{file_size}|{total_chunks}"
@@ -98,6 +163,17 @@ class ReliableUDPTransfer:
                         self.on_message("success", "接收端已确认文件信息")
                         established = True
                         break
+                except ConnectionResetError:
+                    # Windows 下 UDP 目标端口无监听时，内核回 ICMP 端口不可达，
+                    # 下一次 recvfrom 会抛 ConnectionResetError(10054)。
+                    # 这代表接收端未启动/已停止，无需重试，直接给出友好提示。
+                    self.on_message(
+                        "error",
+                        f"目标端口 {target_port} 无监听（接收端未启动或已停止）。"
+                        "请先在「接收文件」页签点「▶️ 开始监听」，再发送文件。",
+                    )
+                    sock.close()
+                    return False
                 except socket.timeout:
                     if retry == self.max_retries - 1:
                         self.on_message("error", "无法建立连接：接收端未响应")
@@ -160,6 +236,10 @@ class ReliableUDPTransfer:
                         self.on_status(f"确认进度: {len(acked_chunks)}/{total_chunks} | 速度: {speed:.2f} MB/s")
                 except socket.timeout:
                     pass
+                except ConnectionResetError:
+                    self.on_message("error", "接收端连接已断开（可能已停止监听），传输中止")
+                    sock.close()
+                    return False
                 except Exception as e:
                     self.on_message("warning", f"接收ACK时出错: {e}")
 
@@ -239,9 +319,9 @@ class ReliableUDPTransfer:
             with open(temp_file, "wb") as f:
                 f.write(sample_data)
         except Exception as e:
-            self.on_message("error", f"保存传输数据错误: {e}")
+            self._notify("error", f"保存传输数据错误: {e}")
 
-        self.on_message("success", f"✅ {direction}数据已保存用于误码率分析 (已备份到文件)")
+        self._notify("success", f"✅ {direction}数据已保存用于误码率分析 (已备份到文件)")
         return record
 
     def load_transmission_data_from_file(self, direction: str) -> Optional[Dict[str, Any]]:
@@ -275,36 +355,84 @@ class ReliableUDPTransfer:
             return None
 
     # ---------- 接收 ----------
+    def stop_receiver(self) -> None:
+        """停止接收端：设置停止事件并关闭 socket，使阻塞的 recvfrom 立即返回。"""
+        self._receiver_stop.set()
+        # 立即反映"未监听"；线程 finally 中还有 generation 兜底，不会误清新线程的状态
+        self._receiver_alive.clear()
+        sock = self._receiver_socket
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
     def start_receiver(self, listen_port: int, save_dir: str):
-        """启动接收端，接收文件并返回用于误码率分析的数据记录。"""
+        """启动接收端，接收文件并返回用于误码率分析的数据记录。
+
+        持续监听直到收到 ``END_OF_TRANSMISSION`` 完成一次传输，或调用
+        :meth:`stop_receiver` 主动停止。若 ``listen_port`` 被占用则自动尝试
+        下一个可用端口，并通过 ``receiver_actual_port`` 暴露实际端口。
+        """
+        sock: Optional[socket.socket] = None
+        self._receiver_stop.clear()
+        self.receiver_error = None
+        self.receiver_actual_port = None
+        self._receiver_thread_ident = threading.get_ident()
+        with self._receiver_lock:
+            self._receiver_generation += 1
+            generation = self._receiver_generation
+            self._receiver_alive.set()
         try:
             os.makedirs(save_dir, exist_ok=True)
 
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-            sock.bind(("0.0.0.0", listen_port))
-            sock.settimeout(1.0)
+            # 绑定端口；失败则自动尝试下一个可用端口
+            bound_port: Optional[int] = None
+            max_attempts = 10
+            for attempt in range(max_attempts):
+                candidate = listen_port + attempt
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                    sock.bind(("0.0.0.0", candidate))
+                    sock.settimeout(1.0)
+                    bound_port = candidate
+                    break
+                except OSError:
+                    if sock is not None:
+                        sock.close()
+                        sock = None
+                    continue
 
-            self.on_message("success", f"开始在端口 {listen_port} 监听...")
+            if bound_port is None:
+                self.receiver_error = f"端口 {listen_port}~{listen_port + max_attempts - 1} 均被占用，无法监听"
+                self._receiver_log("error", self.receiver_error)
+                return None
+
+            assert sock is not None  # bound_port 非空说明 bind 已成功，sock 必非 None
+            self._receiver_socket = sock
+            self.receiver_actual_port = bound_port
+            if bound_port != listen_port:
+                self._receiver_log("info", f"端口 {listen_port} 被占用，已自动改用端口 {bound_port} 监听")
+
+            self._receiver_log("success", f"开始在端口 {bound_port} 监听...")
 
             received_data: Dict[int, bytes] = {}
             total_chunks = 0
             filename = ""
             start_time = time.time()
-            last_packet_time = time.time()
 
             receiver_modulation_type = "BPSK"
             receiver_coding_scheme = "重复编码"
             receiver_snr_db = 10.0
 
-            self.on_progress(0, 1)
+            self._receiver_update_progress(0, 1)
             self._reset_state()
 
-            while True:
+            while not self._receiver_stop.is_set():
                 try:
                     data, addr = sock.recvfrom(self.chunk_size + 8)
-                    last_packet_time = time.time()
 
                     if data.startswith(b"FILE_INFO"):
                         info_parts = data.decode().split("|")
@@ -315,19 +443,19 @@ class ReliableUDPTransfer:
                             receiver_modulation_type = info_parts[4]
                             receiver_coding_scheme = info_parts[5]
                             receiver_snr_db = float(info_parts[6])
-                            self.on_message(
+                            self._receiver_log(
                                 "info",
                                 f"📡 从发送端接收参数: 调制={receiver_modulation_type}, "
                                 f"编码={receiver_coding_scheme}, 信噪比={receiver_snr_db}dB",
                             )
 
                         sock.sendto(b"ACK_FILE_INFO", addr)
-                        self.on_status(f"开始接收文件: {filename}")
+                        self._receiver_update_status(f"开始接收文件: {filename}")
                         start_time = time.time()
                         continue
 
                     if data == b"END_OF_TRANSMISSION":
-                        self.on_message("success", "传输完成确认收到")
+                        self._receiver_log("success", "传输完成确认收到")
                         break
 
                     if len(data) >= 8:
@@ -341,36 +469,41 @@ class ReliableUDPTransfer:
 
                             if total_chunks > 0:
                                 current = len(received_data)
-                                self.on_progress(current, total_chunks)
+                                self._receiver_update_progress(current, total_chunks)
                                 elapsed = time.time() - start_time
                                 received_size = sum(len(d) for d in received_data.values())
                                 speed = (received_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
-                                self.on_status(f"接收进度: {current}/{total_chunks} | 速度: {speed:.2f} MB/s")
+                                self._receiver_update_status(f"接收进度: {current}/{total_chunks} | 速度: {speed:.2f} MB/s")
 
                             if len(received_data) >= total_chunks > 0:
                                 break
 
                         except struct.error as e:
-                            self.on_message("warning", f"数据包解析错误: {e}")
+                            self._receiver_log("warning", f"数据包解析错误: {e}")
                             continue
 
                 except socket.timeout:
-                    if time.time() - last_packet_time > self.timeout * 3:
-                        self.on_message("warning", "接收超时，可能传输已结束")
-                        break
+                    # 一直监听：空闲超时不退出，继续等待下一个数据包
                     continue
 
+                except OSError as e:
+                    # recvfrom 抛 OSError 通常意味着 socket 已被 stop_receiver 关闭，直接退出
+                    if not self._receiver_stop.is_set():
+                        self._receiver_log("error", f"接收错误: {str(e)}")
+                    break
+
                 except Exception as e:
-                    self.on_message("error", f"接收错误: {str(e)}")
+                    self._receiver_log("error", f"接收错误: {str(e)}")
                     if len(received_data) >= total_chunks > 0:
                         break
                     continue
 
-            sock.close()
-
             # 重组文件（即使不完整也保存）
             if not received_data:
-                self.on_message("error", "未接收到有效数据")
+                if self._receiver_stop.is_set():
+                    self._receiver_log("info", "接收端已停止")
+                else:
+                    self._receiver_log("error", "未接收到有效数据")
                 return None
 
             sorted_data: List[bytes] = []
@@ -382,7 +515,7 @@ class ReliableUDPTransfer:
                     missing_chunks.append(i)
 
             if missing_chunks:
-                self.on_message("warning", f"缺失 {len(missing_chunks)} 个数据块: {missing_chunks}")
+                self._receiver_log("warning", f"缺失 {len(missing_chunks)} 个数据块: {missing_chunks}")
 
             file_data = b"".join(sorted_data)
 
@@ -390,9 +523,9 @@ class ReliableUDPTransfer:
             try:
                 with open(save_path, "wb") as f:
                     f.write(file_data)
-                self.on_message("success", f"文件保存成功: {save_path}")
+                self._receiver_log("success", f"文件保存成功: {save_path}")
             except Exception as save_error:
-                self.on_message("error", f"文件保存失败: {save_error}")
+                self._receiver_log("error", f"文件保存失败: {save_error}")
 
             elapsed = time.time() - start_time
             file_size_mb = len(file_data) / 1024 / 1024
@@ -400,8 +533,8 @@ class ReliableUDPTransfer:
             completion_ratio = len(received_data) / total_chunks if total_chunks > 0 else 0
 
             if completion_ratio < 1.0:
-                self.on_message("warning", f"文件接收不完整: {completion_ratio:.1%}")
-            self.on_message(
+                self._receiver_log("warning", f"文件接收不完整: {completion_ratio:.1%}")
+            self._receiver_log(
                 "info",
                 f"传输统计: 大小 {file_size_mb:.2f} MB, 时间 {elapsed:.2f} 秒, "
                 f"平均速度 {speed:.2f} MB/s, 完整度 {completion_ratio:.1%}",
@@ -413,5 +546,19 @@ class ReliableUDPTransfer:
             )
 
         except Exception as e:
-            self.on_message("error", f"启动接收端失败: {str(e)}")
+            self.receiver_error = f"启动接收端失败: {str(e)}"
+            self._receiver_log("error", self.receiver_error)
             return None
+        finally:
+            # generation 兜底：仅当没有更新的接收线程启动时才清除 alive，避免误清新线程状态
+            with self._receiver_lock:
+                if self._receiver_generation == generation:
+                    self._receiver_alive.clear()
+            self._receiver_socket = None
+            self._receiver_thread_ident = None
+            self._receiver_stop.clear()
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass

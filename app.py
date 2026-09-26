@@ -411,9 +411,9 @@ def display_signal_visualization_enhanced(
                 ax4.set_title("信号虚部对比")
             else:
                 ax4.plot(time_axis, np.abs(simulation_results["modulated_signal"][:display_length]),
-                         "purple-", label="调制信号幅度", linewidth=1.5, alpha=0.8)
+                         color="purple", linestyle="-", label="调制信号幅度", linewidth=1.5, alpha=0.8)
                 ax4.plot(time_axis, np.abs(simulation_results["noisy_signal"][:display_length]),
-                         "brown-", label="加噪信号幅度", linewidth=1, alpha=0.6)
+                         color="brown", linestyle="-", label="加噪信号幅度", linewidth=1, alpha=0.6)
                 ax4.set_xlabel("时间")
                 ax4.set_ylabel("幅度")
                 ax4.set_title("信号幅度对比")
@@ -474,6 +474,66 @@ def display_signal_visualization_enhanced(
 
 
 # ---------------------------------------------------------------------------
+# 接收端实时面板
+# ---------------------------------------------------------------------------
+@st.fragment(run_every="1s")
+def _render_receiver_panel(transfer: ReliableUDPTransfer, monitor_quality: bool, snr_db: float) -> None:
+    """接收端实时面板：监听状态、端口切换提示、错误、进度与日志（每秒自动刷新）。"""
+    events = transfer.drain_receiver_events()
+
+    # 累积消息到 session_state，避免刷新后丢失
+    if "receiver_log" not in st.session_state:
+        st.session_state.receiver_log = []
+    st.session_state.receiver_log.extend(events["messages"])
+    st.session_state.receiver_log = st.session_state.receiver_log[-50:]
+
+    # 监听状态
+    if transfer.receiver_alive:
+        port_note = f"（端口 {transfer.receiver_actual_port}）" if transfer.receiver_actual_port else ""
+        st.info(f"🔴 接收端正在监听中...{port_note}")
+    else:
+        st.info("⚪ 接收端未运行")
+
+    if transfer.receiver_error:
+        st.error(transfer.receiver_error)
+
+    done, total = events["progress"]
+    if total > 0:
+        st.progress(min(done / total, 1.0))
+    if events["status"]:
+        st.caption(events["status"])
+
+    # 接收日志
+    if st.session_state.receiver_log:
+        with st.expander(f"📜 接收日志（{len(st.session_state.receiver_log)} 条）", expanded=True):
+            for level, text in st.session_state.receiver_log:
+                show = {"success": st.success, "error": st.error, "warning": st.warning, "info": st.info}.get(
+                    level, st.info
+                )
+                show(text)
+
+    # 信道质量监控（演示数据）
+    if transfer.receiver_alive and monitor_quality:
+        st.subheader("📡 实际信道质量监控")
+        col_qual1, col_qual2, col_qual3 = st.columns(3)
+        with col_qual1:
+            actual_snr = snr_db + random.uniform(-2, 2)
+            st.metric("估计实际信噪比", f"{actual_snr:.1f} dB")
+        with col_qual2:
+            packet_loss = random.uniform(0, 5)
+            st.metric("估计包丢失率", f"{packet_loss:.2f}%")
+        with col_qual3:
+            latency = random.uniform(10, 100)
+            st.metric("估计网络延迟", f"{latency:.1f} ms")
+        st.info("""
+        **说明:**
+        - 实际信道质量基于当前网络环境和系统参数估计
+        - 这些值会因网络状况实时变化
+        - 用于与模拟信道参数对比参考
+        """)
+
+
+# ---------------------------------------------------------------------------
 # 主界面
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -494,10 +554,6 @@ def main() -> None:
     transfer: ReliableUDPTransfer = st.session_state.transfer
 
     # 初始化 session state
-    if "receiver_running" not in st.session_state:
-        st.session_state.receiver_running = False
-    if "receiver_thread" not in st.session_state:
-        st.session_state.receiver_thread = None
     if "coding_scheme" not in st.session_state:
         st.session_state.coding_scheme = "重复编码"
     if "ber_analysis_results" not in st.session_state:
@@ -596,30 +652,38 @@ def main() -> None:
             if estimated_time > 1:
                 st.info(f"预计传输时间: {estimated_time:.1f} 秒")
 
-        if st.button("🚀 开始发送", type="primary") and uploaded_file is not None:
-            with st.spinner("建立连接并发送文件中..."):
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-
-                def _on_progress(done: int, total: int) -> None:
-                    progress_bar.progress(min(done / total, 1.0) if total else 0.0)
-
-                def _on_status(text: str) -> None:
-                    status_text.text(text)
-
-                transfer.on_progress = _on_progress
-                transfer.on_status = _on_status
-
-                record = transfer.send_file(
-                    target_ip, target_port, uploaded_file.getvalue(), uploaded_file.name,
-                    modulation_type, coding_scheme, snr_db,
+        if st.button("🚀 开始发送", type="primary"):
+            if uploaded_file is None:
+                st.warning("请先选择要发送的文件")
+            elif target_ip.strip() in ("127.0.0.1", "localhost", "::1") and not transfer.receiver_alive:
+                st.error(
+                    "❌ 目标为本地主机，但接收端未在监听。"
+                    "请先切换到「接收文件」页签点「▶️ 开始监听」，再回来发送。"
                 )
-                if record:
-                    st.session_state.sent_data = record
-                    st.balloons()
-                    st.success("✅ 文件发送成功完成!")
-                else:
-                    st.error("❌ 文件发送失败")
+            else:
+                with st.spinner("建立连接并发送文件中..."):
+                    progress_bar = st.progress(0.0)
+                    status_text = st.empty()
+
+                    def _on_progress(done: int, total: int) -> None:
+                        progress_bar.progress(min(done / total, 1.0) if total else 0.0)
+
+                    def _on_status(text: str) -> None:
+                        status_text.text(text)
+
+                    transfer.on_progress = _on_progress
+                    transfer.on_status = _on_status
+
+                    record = transfer.send_file(
+                        target_ip, target_port, uploaded_file.getvalue(), uploaded_file.name,
+                        modulation_type, coding_scheme, snr_db,
+                    )
+                    if record:
+                        st.session_state.sent_data = record
+                        st.balloons()
+                        st.success("✅ 文件发送成功完成!")
+                    else:
+                        st.error("❌ 文件发送失败")
         elif uploaded_file is None:
             st.warning("请先选择要发送的文件")
 
@@ -652,63 +716,31 @@ def main() -> None:
                 help="启用后会在接收端显示实际信道质量统计",
             )
 
-            if st.button("▶️ 开始监听", type="primary") and not st.session_state.receiver_running:
-                progress_bar = st.progress(0.0)
-                status_text = st.empty()
-
-                def _on_progress(done: int, total: int) -> None:
-                    progress_bar.progress(min(done / total, 1.0) if total else 0.0)
-
-                def _on_status(text: str) -> None:
-                    status_text.text(text)
-
-                transfer.on_progress = _on_progress
-                transfer.on_status = _on_status
+            if st.button("▶️ 开始监听", type="primary") and not transfer.receiver_alive:
+                transfer.stop_receiver()  # 清理可能残留的旧 socket / 停止事件
 
                 def receiver_thread() -> None:
-                    st.session_state.receiver_running = True
                     record = transfer.start_receiver(listen_port, save_dir)
                     if record:
-                        st.session_state.received_data = record
-                        st.session_state.ber_analysis_needed = True
-                    st.session_state.receiver_running = False
+                        transfer.set_last_received_record(record)
 
                 thread = threading.Thread(target=receiver_thread)
                 thread.daemon = True
                 thread.start()
-                st.session_state.receiver_thread = thread
                 st.success("接收端已启动! 等待连接...")
 
-            if st.button("⏹️ 停止监听") and st.session_state.receiver_running:
-                st.session_state.receiver_running = False
+            if st.button("⏹️ 停止监听") and transfer.receiver_alive:
+                transfer.stop_receiver()
                 st.success("接收端已停止")
 
-        if st.session_state.receiver_running:
-            st.info("🔴 接收端正在运行中...")
+        # 接收线程产出结果 -> 主线程写入 session_state（后台线程不直接写 session_state）
+        record = transfer.take_last_received_record()
+        if record is not None:
+            st.session_state.received_data = record
+            st.session_state.ber_analysis_needed = True
 
-            if monitor_quality:
-                st.subheader("📡 实际信道质量监控")
-                col_qual1, col_qual2, col_qual3 = st.columns(3)
-
-                with col_qual1:
-                    # 模拟的实际信噪比（演示数据，仅用于界面展示）
-                    actual_snr = snr_db + random.uniform(-2, 2)
-                    st.metric("估计实际信噪比", f"{actual_snr:.1f} dB")
-                with col_qual2:
-                    packet_loss = random.uniform(0, 5)
-                    st.metric("估计包丢失率", f"{packet_loss:.2f}%")
-                with col_qual3:
-                    latency = random.uniform(10, 100)
-                    st.metric("估计网络延迟", f"{latency:.1f} ms")
-
-                st.info("""
-                **说明:**
-                - 实际信道质量基于当前网络环境和系统参数估计
-                - 这些值会因网络状况实时变化
-                - 用于与模拟信道参数对比参考
-                """)
-        else:
-            st.info("⚪ 接收端未运行")
+        # 接收端实时面板：状态 / 端口切换 / 错误 / 进度 / 日志（每秒自动刷新）
+        _render_receiver_panel(transfer, monitor_quality, snr_db)
 
         # 文件管理
         st.subheader("🗂️ 文件管理")
