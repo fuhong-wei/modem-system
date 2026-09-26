@@ -128,3 +128,8 @@ mypy src
 
 - `ModemSystem`：调制解调与信道模拟核心
 - `ReliableUDPTransfer`：基于 UDP 的可靠传输（滑动窗口 + 重传）
+
+## 开发记录
+
+- [项目问题复盘与面试准备](PROBLEMS_AND_SOLUTIONS.md)：开发过程中踩过的坑、排查思路与解决方案（含面试问答准备）
+- [接收端状态同步 Bug 复盘](PROJECT_REVIEW.md)：`receiver_alive` 竞态问题的详细复盘

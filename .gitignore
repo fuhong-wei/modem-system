@@ -58,3 +58,7 @@ desktop.ini
 # 个人报告文档（含个人信息，不提交）
 *.docx
 *.doc
+
+# 运行时产物（接收文件 / 误码率分析临时数据）
+received_files/
+temp_analysis/
