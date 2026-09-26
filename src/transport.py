@@ -320,9 +320,11 @@ class ReliableUDPTransfer:
 
         sample_data = file_data if self.sample_size is None else file_data[:self.sample_size]
         bits = self.bytes_to_bits(sample_data)
+        # 字段名按方向区分：sent 存「原始比特」，received 存「接收比特」，避免歧义
+        bits_key = "received_bits" if direction == "received" else "original_bits"
 
         record = {
-            "original_bits": bits,
+            bits_key: bits,
             "filename": filename,
             "file_size": len(file_data),
             "analyzed_bytes": len(sample_data),
@@ -365,9 +367,10 @@ class ReliableUDPTransfer:
 
             filename = os.path.basename(latest_file).split("_", 2)[2].rsplit("_", 1)[0]
             bits = self.bytes_to_bits(file_data)
+            bits_key = "received_bits" if direction == "received" else "original_bits"
 
             return {
-                "original_bits": bits,
+                bits_key: bits,
                 "filename": filename,
                 "file_size": len(file_data),
                 "analyzed_bytes": len(file_data),

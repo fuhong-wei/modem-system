@@ -134,27 +134,37 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
         # 2. 实际传输误码率计算
         st.write("**实际传输结果:**")
 
+        transfer_incomplete = False
         if "received_data" in st.session_state:
             received_data = st.session_state.received_data
-            received_bits = received_data["original_bits"]
+            received_bits = received_data["received_bits"]
+            completion_ratio = received_data.get("completion_ratio")
 
-            min_len_actual = min(len(original_bits), len(received_bits))
-            actual_errors = 0
-            if min_len_actual > 0:
+            if completion_ratio is not None and completion_ratio < 1.0:
+                # 传输不完整时字节会错位，实际误码率无意义
+                transfer_incomplete = True
+                st.write(f"- 传输完整度: {completion_ratio:.1%}（不完整）")
+                st.write("- 实际误码率: ⚠️ 传输不完整，误码率无意义")
+                actual_ber = None
+                actual_errors = 0
+                min_len_actual = 0
+                data_consistent = False
+                received_bits_sample = []
+            else:
+                min_len_actual = min(len(original_bits), len(received_bits))
                 actual_errors = int(
                     np.sum(np.array(original_bits[:min_len_actual]) != np.array(received_bits[:min_len_actual]))
-                )
+                ) if min_len_actual > 0 else 0
+                actual_ber = transfer.modem.calculate_ber(original_bits, received_bits)
+                data_consistent = actual_errors == 0
 
-            actual_ber = actual_errors / min_len_actual if min_len_actual > 0 else 0
-            data_consistent = actual_errors == 0
-
-            st.write(f"- 对比比特数: {min_len_actual}")
-            st.write(f"- 错误比特数: {actual_errors}")
-            st.write(f"- 实际误码率: {actual_ber:.6f}")
-            st.write(f"- 数据一致性: {'✅ 完全一致' if data_consistent else '❌ 不一致'}")
+                st.write(f"- 对比比特数: {min_len_actual}")
+                st.write(f"- 错误比特数: {actual_errors}")
+                st.write(f"- 实际误码率: {actual_ber:.6f}")
+                st.write(f"- 数据一致性: {'✅ 完全一致' if data_consistent else '❌ 不一致'}")
+                received_bits_sample = received_bits[:100] if len(received_bits) > 100 else received_bits
 
             received_filename = received_data["filename"]
-            received_bits_sample = received_bits[:100] if len(received_bits) > 100 else received_bits
             st.write(
                 f"- 接收端实际参数: 调制={received_data['modulation_type']}, "
                 f"编码={received_data['coding_scheme']}, 信噪比={received_data['snr_db']}dB"
@@ -179,6 +189,7 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
             "actual_errors": actual_errors,
             "actual_total_bits": min_len_actual,
             "data_consistent": data_consistent,
+            "transfer_incomplete": transfer_incomplete,
             "simulated_ber": simulation_results["simulated_ber"],
             "simulated_errors": simulation_results["errors"],
             "simulated_total_bits": simulation_results["compared_bits"],
@@ -958,7 +969,10 @@ def main() -> None:
             col_ber1, col_ber2 = st.columns(2)
 
             with col_ber1:
-                if results["actual_ber"] is not None:
+                if results.get("transfer_incomplete"):
+                    st.metric("实际传输误码率", "传输不完整", help="传输不完整，字节错位，误码率无意义")
+                    st.warning("**⚠️ 传输不完整**: 数据块缺失导致字节错位，实际误码率无意义")
+                elif results["actual_ber"] is not None:
                     actual_ber_display = f"{results['actual_ber']:.8f}" if results["actual_ber"] > 0 else "0.000000"
                     delta_text = f"{results['actual_errors']} 错误比特" if results["actual_errors"] > 0 else "0 错误比特"
                     st.metric("实际传输误码率", actual_ber_display, delta=delta_text,
