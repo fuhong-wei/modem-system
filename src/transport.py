@@ -7,6 +7,7 @@ import glob
 import json
 import logging
 import os
+import select
 import socket
 import struct
 import threading
@@ -226,35 +227,68 @@ class ReliableUDPTransfer:
                         self.on_message("error", f"发送数据包 {chunk_idx} 失败: {e}")
                         break
 
-                # 接收 ACK
+                # 接收 ACK：先把缓冲区里积压的 ACK 一次性读空。
+                # 原实现每轮只 recvfrom 一次、读 1 个 ACK，窗口 16 时接收端
+                # 一次发回 16 个 ACK，发送端要 16 轮才读完，窗口尾部包的 ACK
+                # 迟迟没被读出来、age 超过 timeout，被误判丢包触发假重传。
+                got_ack = False
                 try:
-                    sock.settimeout(0.1)
-                    data, _addr = sock.recvfrom(1024)
-                    if data.startswith(b"ACK"):
-                        ack_idx = int(data.split(b"|")[1])
-                        acked_chunks.add(ack_idx)
-                        last_ack_time = time.time()
+                    # 第一遍：非阻塞读空当前缓冲区里所有积压的 ACK
+                    sock.settimeout(0)
+                    while True:
+                        try:
+                            data, _addr = sock.recvfrom(1024)
+                        except (BlockingIOError, socket.timeout):
+                            break  # 缓冲区读空，正常结束
+                        if data.startswith(b"ACK"):
+                            acked_chunks.add(int(data.split(b"|")[1]))
+                            last_ack_time = time.time()
+                            got_ack = True
 
-                        while window_start in acked_chunks:
-                            window_start += 1
-
-                        self.on_progress(len(acked_chunks), total_chunks)
-                        elapsed = time.time() - start_time
-                        speed = (len(acked_chunks) * self.chunk_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
-                        self.on_status(f"确认进度: {len(acked_chunks)}/{total_chunks} | 速度: {speed:.2f} MB/s")
-                except socket.timeout:
-                    pass
+                    # 这一轮一个 ACK 都没读到，才短等待一次再尝试，避免空转拖慢流程
+                    if not got_ack:
+                        readable, _, _ = select.select([sock], [], [], 0.01)
+                        if readable:
+                            while True:
+                                try:
+                                    data, _addr = sock.recvfrom(1024)
+                                except (BlockingIOError, socket.timeout):
+                                    break
+                                if data.startswith(b"ACK"):
+                                    acked_chunks.add(int(data.split(b"|")[1]))
+                                    last_ack_time = time.time()
+                                    got_ack = True
                 except ConnectionResetError:
                     self.on_message("error", "接收端连接已断开（可能已停止监听），传输中止")
                     sock.close()
                     return False
                 except Exception as e:
                     self.on_message("warning", f"接收ACK时出错: {e}")
+                finally:
+                    # 恢复阻塞超时，保证异常路径下 socket 状态不被破坏
+                    try:
+                        sock.settimeout(self.ack_timeout)
+                    except OSError:
+                        pass  # socket 可能已被关闭
+
+                # 统一推进滑动窗口（ACK 批量读空后，窗口能一次前进多位）
+                while window_start in acked_chunks:
+                    window_start += 1
+
+                if got_ack:
+                    self.on_progress(len(acked_chunks), total_chunks)
+                    elapsed = time.time() - start_time
+                    speed = (len(acked_chunks) * self.chunk_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
+                    self.on_status(f"确认进度: {len(acked_chunks)}/{total_chunks} | 速度: {speed:.2f} MB/s")
 
                 # 超时重传
                 current_time = time.time()
                 for chunk_idx in range(window_start, min(window_start + self.window_size, total_chunks)):
-                    if chunk_idx not in acked_chunks and current_time - self._sent_time.get(chunk_idx, 0) > self.timeout:
+                    if (
+                        chunk_idx not in acked_chunks
+                        and chunk_idx in self._sent_time
+                        and current_time - self._sent_time[chunk_idx] > self.timeout
+                    ):
                         if self._retry_count.get(chunk_idx, 0) < self.max_retries:
                             start = chunk_idx * self.chunk_size
                             end = min((chunk_idx + 1) * self.chunk_size, file_size)
