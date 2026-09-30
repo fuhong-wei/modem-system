@@ -7,16 +7,24 @@ import numpy as np
 from scipy import signal as scipy_signal
 
 
-def plot_constellation(signal, title: str = "星座图", ax=None, modulation_type: Optional[str] = None):
+def plot_constellation(signal, title: str = "星座图", ax=None,
+                       modulation_type: Optional[str] = None,
+                       samples_per_symbol: int = 5, max_symbols: int = 500):
     """绘制星座图：提取信号的 I/Q 分量，在复平面上画散点并标出理想星座点。
 
     无论实信号（BPSK，Q 恒为 0）还是复信号（QPSK，I/Q 都有值），都统一画成
     复平面散点图，横轴 In-phase (I)、纵轴 Quadrature (Q)。
+
+    ``samples_per_symbol`` 必须与 ``ModemSystem.bit_duration`` 一致：
+    每个符号占这么多个样点，只取每个符号的第一个点，避免过采样点糊成一团。
+    原来写死为 5，一旦改 bit_duration 星座图就会画错。
     """
     if ax is None:
         _fig, ax = plt.subplots(figsize=(6, 6))
 
-    samples = np.asarray(signal[:1000:5] if len(signal) > 1000 else signal)
+    sig = np.asarray(signal)
+    step = max(int(samples_per_symbol), 1)
+    samples = sig[::step][:max_symbols]
 
     # 提取 I/Q 分量：BPSK 为实信号（Q 全 0），QPSK 为复信号
     inphase = np.real(samples)
@@ -58,25 +66,46 @@ def plot_constellation(signal, title: str = "星座图", ax=None, modulation_typ
 
 
 def plot_spectrum(signal, title: str = "频谱图", ax=None, fs: int = 1000):
-    """绘制单边幅度谱。"""
+    """绘制幅度谱。
+
+    实信号（BPSK）频谱共轭对称，只画正频率 0~fs/2 即可。
+    复基带信号（QPSK）频谱左右不对称，必须 fftshift 后画完整的
+    -fs/2~fs/2，只取前半会丢掉一半信息。
+
+    注意：``fs`` 只是给横轴一个可读刻度的假定采样率。调制输出是
+    「每比特 bit_duration 个样点」的基带序列，没有物理采样率，
+    因此横轴数值只有相对意义。
+    """
     if ax is None:
         _fig, ax = plt.subplots(figsize=(10, 4))
 
-    fft_result = np.fft.fft(signal)
-    freq = np.fft.fftfreq(len(signal), 1 / fs)
-    positive_freq = freq[:len(freq) // 2]
-    positive_fft = np.abs(fft_result[:len(fft_result) // 2])
+    sig = np.asarray(signal)
+    if sig.size == 0:
+        ax.set_title(f"{title}（无数据）")
+        ax.grid(True, alpha=0.3)
+        return ax
 
-    if np.iscomplexobj(signal):
-        ax.plot(positive_freq, 20 * np.log10(positive_fft + 1e-10), linewidth=1, alpha=0.8)
+    fft_result = np.fft.fft(sig)
+    freq = np.fft.fftfreq(sig.size, 1 / fs)
+
+    if np.iscomplexobj(sig):
+        freq_axis = np.fft.fftshift(freq)
+        magnitude = np.abs(np.fft.fftshift(fft_result))
+        xlim = (-fs / 2, fs / 2)
+        color = None
     else:
-        ax.plot(positive_freq, 20 * np.log10(positive_fft + 1e-10), linewidth=1, alpha=0.8, color="green")
+        half = max(sig.size // 2, 1)
+        freq_axis = freq[:half]
+        magnitude = np.abs(fft_result[:half])
+        xlim = (0, fs / 2)
+        color = "green"
 
-    ax.set_xlabel("频率 (Hz)")
+    ax.plot(freq_axis, 20 * np.log10(magnitude + 1e-10), linewidth=1, alpha=0.8, color=color)
+    ax.set_xlabel(f"等效频率 (Hz，假定采样率 fs={fs})")
     ax.set_ylabel("幅度 (dB)")
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    ax.set_xlim([0, fs / 2])
+    ax.set_xlim(xlim)
     return ax
 
 
@@ -90,5 +119,6 @@ def plot_spectrogram(signal, title: str = "时频图（Spectrogram）", ax=None,
     ax.set_ylabel("频率 (Hz)")
     ax.set_xlabel("时间 (s)")
     ax.set_title(title)
-    plt.colorbar(im, ax=ax, label="幅度 (dB)")
+    # 传了 ax 就该用它所属 figure 的 colorbar，不依赖 pyplot 的"当前 figure"全局状态
+    ax.figure.colorbar(im, ax=ax, label="幅度 (dB)")
     return ax

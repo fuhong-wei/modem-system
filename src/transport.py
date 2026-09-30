@@ -4,6 +4,7 @@
 """
 
 import glob
+import json
 import logging
 import os
 import socket
@@ -112,16 +113,22 @@ class ReliableUDPTransfer:
 
     # ---------- 字节 <-> 比特 ----------
     @staticmethod
-    def bytes_to_bits(data: bytes) -> List[int]:
-        """字节数据 -> 比特列表。"""
+    def bytes_to_bits(data: bytes) -> np.ndarray:
+        """字节数据 -> 比特数组（uint8 的 ndarray）。
+
+        不再调用 ``.tolist()``：88MB 文件会产生 7 亿个 Python int（约 28GB），
+        直接把进程撑爆。ndarray 只占 7 亿字节，且切片是视图、不拷贝。
+        """
         data_array = np.frombuffer(data, dtype=np.uint8)
-        return np.unpackbits(data_array).tolist()
+        return np.unpackbits(data_array)
 
     @staticmethod
-    def bits_to_bytes(bits: List[int]) -> bytes:
-        """比特列表 -> 字节数据。"""
-        padded_bits = bits + [0] * ((8 - len(bits) % 8) % 8)
-        bit_array = np.array(padded_bits, dtype=np.uint8)
+    def bits_to_bytes(bits) -> bytes:
+        """比特序列 -> 字节数据（同时接受 list 和 ndarray）。"""
+        bit_array = np.asarray(bits, dtype=np.uint8)
+        pad = (8 - bit_array.size % 8) % 8
+        if pad:
+            bit_array = np.concatenate([bit_array, np.zeros(pad, dtype=np.uint8)])
         return np.packbits(bit_array).tobytes()
 
     def _reset_state(self) -> None:
@@ -278,15 +285,19 @@ class ReliableUDPTransfer:
             total_time = time.time() - start_time
             total_speed = (file_size / 1024 / 1024) / total_time if total_time > 0 else 0
             total_retransmissions = sum(self._retry_count.values())
+            # 发生过重传的「块数」才是丢包的近似值；总重传「次数」会把同一块的多次重传重复计入
+            retransmitted_chunks = len(self._retry_count)
             self.on_message(
                 "success",
-                f"文件发送完成! 总时间: {total_time:.2f}秒, 平均速度: {total_speed:.2f} MB/s, 重传 {total_retransmissions} 次",
+                f"文件发送完成! 总时间: {total_time:.2f}秒, 平均速度: {total_speed:.2f} MB/s, "
+                f"重传 {total_retransmissions} 次（涉及 {retransmitted_chunks} 个数据块）",
             )
             sock.close()
 
             return self.save_transmission_data(
                 file_data, filename, "sent", modulation_type, coding_scheme, snr_db,
                 duration=total_time, speed=total_speed, retransmissions=total_retransmissions,
+                retransmitted_chunks=retransmitted_chunks,
                 total_chunks=total_chunks,
             )
 
@@ -306,6 +317,7 @@ class ReliableUDPTransfer:
         duration: Optional[float] = None,
         speed: Optional[float] = None,
         retransmissions: Optional[int] = None,
+        retransmitted_chunks: Optional[int] = None,
         total_chunks: Optional[int] = None,
         completion_ratio: Optional[float] = None,
         missing_chunks: Optional[int] = None,
@@ -335,6 +347,7 @@ class ReliableUDPTransfer:
             "duration": duration,
             "speed": speed,
             "retransmissions": retransmissions,
+            "retransmitted_chunks": retransmitted_chunks,
             "total_chunks": total_chunks,
             "completion_ratio": completion_ratio,
             "missing_chunks": missing_chunks,
@@ -342,14 +355,36 @@ class ReliableUDPTransfer:
 
         try:
             os.makedirs("./temp_analysis", exist_ok=True)
-            temp_file = f"./temp_analysis/{direction}_{filename}_{int(time.time())}.dat"
+            safe_name = filename.replace(os.sep, "_").replace("/", "_")
+            temp_file = f"./temp_analysis/{direction}_{safe_name}_{int(time.time())}.dat"
             with open(temp_file, "wb") as f:
                 f.write(sample_data)
+            # 元数据写到同名 .json 边车文件。否则从文件恢复时调制方式/编码/信噪比/
+            # 完整度/性能指标全部丢失，只能用死板的默认值瞎猜，分析结果毫无意义。
+            meta = {k: v for k, v in record.items() if k != bits_key}
+            with open(temp_file[:-4] + ".json", "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+            self._prune_temp_analysis(direction)
         except Exception as e:
             self._notify("error", f"保存传输数据错误: {e}")
 
         self._notify("success", f"✅ {direction}数据已保存用于误码率分析 (已备份到文件)")
         return record
+
+    @staticmethod
+    def _prune_temp_analysis(direction: str, keep: int = 5) -> None:
+        """只保留最近 keep 份临时分析数据，避免 temp_analysis 无限膨胀。"""
+        files = sorted(
+            glob.glob(f"./temp_analysis/{direction}_*.dat"),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        for old in files[keep:]:
+            for path in (old, old[:-4] + ".json"):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
     def load_transmission_data_from_file(self, direction: str) -> Optional[Dict[str, Any]]:
         """从最新临时文件加载传输数据。"""
@@ -365,26 +400,41 @@ class ReliableUDPTransfer:
             with open(latest_file, "rb") as f:
                 file_data = f.read()
 
-            filename = os.path.basename(latest_file).split("_", 2)[2].rsplit("_", 1)[0]
             bits = self.bytes_to_bits(file_data)
             bits_key = "received_bits" if direction == "received" else "original_bits"
 
+            # 优先读 .json 边车里的真实元数据，读不到才退回文件名解析 + 默认值
+            meta: Dict[str, Any] = {}
+            meta_path = latest_file[:-4] + ".json"
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f)
+                except Exception as e:
+                    self.on_message("warning", f"读取分析元数据失败，改用默认值: {e}")
+
+            # 文件名格式：{direction}_{filename}_{timestamp}.dat
+            # 先去掉 .dat 后缀，再剥掉开头的 direction 和结尾的时间戳，
+            # 否则不含下划线的文件名会被解析成时间戳（如 "1727000000.dat"）
+            stem = os.path.basename(latest_file)[:-4]
+            fallback_name = stem.split("_", 1)[1].rsplit("_", 1)[0] if "_" in stem else stem
+
             return {
                 bits_key: bits,
-                "filename": filename,
-                "file_size": len(file_data),
+                "filename": meta.get("filename") or fallback_name,
+                "file_size": meta.get("file_size", len(file_data)),
                 "analyzed_bytes": len(file_data),
-                "timestamp": os.path.getmtime(latest_file),
-                "modulation_type": self.modem.modulation_type,
-                "coding_scheme": "重复编码",
-                "snr_db": self.modem.snr_db,
-                # 性能指标未持久化到 .dat 文件，从文件恢复时置 None
-                "duration": None,
-                "speed": None,
-                "retransmissions": None,
-                "total_chunks": None,
-                "completion_ratio": None,
-                "missing_chunks": None,
+                "timestamp": meta.get("timestamp", os.path.getmtime(latest_file)),
+                "modulation_type": meta.get("modulation_type", self.modem.modulation_type),
+                "coding_scheme": meta.get("coding_scheme", "重复编码"),
+                "snr_db": meta.get("snr_db", self.modem.snr_db),
+                "duration": meta.get("duration"),
+                "speed": meta.get("speed"),
+                "retransmissions": meta.get("retransmissions"),
+                "retransmitted_chunks": meta.get("retransmitted_chunks"),
+                "total_chunks": meta.get("total_chunks"),
+                "completion_ratio": meta.get("completion_ratio"),
+                "missing_chunks": meta.get("missing_chunks"),
             }
         except Exception as e:
             self.on_message("error", f"从文件加载数据错误: {e}")

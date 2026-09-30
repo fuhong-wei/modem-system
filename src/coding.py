@@ -69,19 +69,33 @@ def hamming_decode(bits: List[int]) -> List[int]:
     return decoded
 
 
-def encode_data(data_bits: List[int], coding_scheme: str = "repetition") -> List[int]:
+def _as_bit_list(bits) -> List[int]:
+    """统一把输入转成 Python list。
+
+    上游 bytes_to_bits 现在返回 ndarray，而 hamming_encode 里的
+    ``chunk + [0] * n`` 对 ndarray 是广播相加（不是拼接），会导致解包报错。
+    在编解码入口统一转换，保证内部纯 Python 逻辑不受影响。
+    """
+    if hasattr(bits, "tolist"):
+        return bits.tolist()
+    return list(bits)
+
+
+def encode_data(data_bits, coding_scheme: str = "repetition") -> List[int]:
     """按编码方案编码数据。方案：repetition / hamming / none。"""
+    bits = _as_bit_list(data_bits)
     if coding_scheme == "repetition":
-        return repetition_encode(data_bits)
+        return repetition_encode(bits)
     if coding_scheme == "hamming":
-        return hamming_encode(data_bits)
-    return data_bits
+        return hamming_encode(bits)
+    return bits
 
 
-def decode_data(encoded_bits: List[int], coding_scheme: str = "repetition") -> List[int]:
+def decode_data(encoded_bits, coding_scheme: str = "repetition") -> List[int]:
     """按编码方案解码数据。"""
+    bits = _as_bit_list(encoded_bits)
     if coding_scheme == "repetition":
-        return repetition_decode(encoded_bits)
+        return repetition_decode(bits)
     if coding_scheme == "hamming":
-        return hamming_decode(encoded_bits)
-    return encoded_bits
+        return hamming_decode(bits)
+    return bits

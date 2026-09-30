@@ -58,7 +58,7 @@ def clear_temp_analysis_files() -> bool:
             return False
 
         deleted_count = 0
-        for file_path in glob.glob("./temp_analysis/*.dat"):
+        for file_path in glob.glob("./temp_analysis/*.dat") + glob.glob("./temp_analysis/*.json"):
             if os.path.isfile(file_path):
                 os.remove(file_path)
                 deleted_count += 1
@@ -102,9 +102,22 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
         if "received_data" not in st.session_state:
             st.warning("⚠️ session state中缺少接收数据，尝试从文件加载...")
             received_data = transfer.load_transmission_data_from_file("received")
-            if received_data:
+            # 只有「同一个文件、且不早于本次发送」的接收记录才允许参与对比，
+            # 否则会拿旧文件的接收数据跟新文件的发送数据比，凭空得出约 50% 的假误码率
+            sent_name = sent_data.get("filename")
+            sent_ts = sent_data.get("timestamp") or 0
+            if (
+                received_data
+                and received_data.get("filename") == sent_name
+                and (received_data.get("timestamp") or 0) >= sent_ts - 1
+            ):
                 st.session_state.received_data = received_data
                 st.success("✅ 从文件成功加载接收数据")
+            elif received_data:
+                st.warning(
+                    f"⚠️ 磁盘上最新的接收记录是「{received_data.get('filename')}」，"
+                    f"与本次发送的「{sent_name}」不匹配，已忽略；本次仅进行模拟信道分析"
+                )
             else:
                 st.warning("⚠️ 无法加载接收数据，将仅进行模拟信道分析")
 
@@ -140,22 +153,33 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
             received_bits = received_data["received_bits"]
             completion_ratio = received_data.get("completion_ratio")
 
-            if completion_ratio is not None and completion_ratio < 1.0:
+            # completion_ratio 为 None 表示来源不明（从没有元数据的旧 .dat 恢复），
+            # 无法确认字节是否错位，和"确认不完整"同等处理，否则会假报警
+            if completion_ratio is None or completion_ratio < 1.0:
                 # 传输不完整时字节会错位，实际误码率无意义
                 transfer_incomplete = True
-                st.write(f"- 传输完整度: {completion_ratio:.1%}（不完整）")
-                st.write("- 实际误码率: ⚠️ 传输不完整，误码率无意义")
+                if completion_ratio is None:
+                    st.write("- 传输完整度: 未知（接收记录缺少完整度信息）")
+                    st.write("- 实际误码率: ⚠️ 无法确认传输是否完整，误码率不可信")
+                else:
+                    st.write(f"- 传输完整度: {completion_ratio:.1%}（不完整）")
+                    st.write("- 实际误码率: ⚠️ 传输不完整，误码率无意义")
                 actual_ber = None
                 actual_errors = 0
                 min_len_actual = 0
                 data_consistent = False
                 received_bits_sample = []
             else:
+                # 一次比较同时得到错误数和误码率；原来先手算一遍再调 calculate_ber
+                # 又比一遍，大文件下等于把全量对比做了两次
                 min_len_actual = min(len(original_bits), len(received_bits))
-                actual_errors = int(
-                    np.sum(np.array(original_bits[:min_len_actual]) != np.array(received_bits[:min_len_actual]))
-                ) if min_len_actual > 0 else 0
-                actual_ber = transfer.modem.calculate_ber(original_bits, received_bits)
+                if min_len_actual > 0:
+                    diff = np.asarray(original_bits[:min_len_actual]) != np.asarray(received_bits[:min_len_actual])
+                    actual_errors = int(np.count_nonzero(diff))
+                    actual_ber = actual_errors / min_len_actual
+                else:
+                    actual_errors = 0
+                    actual_ber = 0.0
                 data_consistent = actual_errors == 0
 
                 st.write(f"- 对比比特数: {min_len_actual}")
@@ -203,6 +227,7 @@ def perform_ber_analysis(transfer: ReliableUDPTransfer) -> None:
             "duration": sent_data.get("duration"),
             "speed": sent_data.get("speed"),
             "retransmissions": sent_data.get("retransmissions"),
+            "retransmitted_chunks": sent_data.get("retransmitted_chunks"),
             "total_chunks": sent_data.get("total_chunks"),
             "recv_completion_ratio": recv_record.get("completion_ratio"),
             "recv_missing_chunks": recv_record.get("missing_chunks"),
@@ -257,13 +282,16 @@ def display_signal_visualization_enhanced(
             if modulation_type == "BPSK":
                 fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
 
+                sps = transfer.modem.bit_duration
                 plot_constellation(
                     simulation_results["modulated_signal"][:500],
                     title="BPSK调制信号星座图", ax=ax1, modulation_type=modulation_type,
+                    samples_per_symbol=sps,
                 )
                 plot_constellation(
                     simulation_results["noisy_signal"][:500],
                     title="BPSK加噪信号星座图", ax=ax2, modulation_type=modulation_type,
+                    samples_per_symbol=sps,
                 )
 
                 display_length = min(100, len(simulation_results["modulated_signal"]))
@@ -292,13 +320,17 @@ def display_signal_visualization_enhanced(
             elif modulation_type == "QPSK":
                 fig, (ax1, ax2, ax3, ax4) = plt.subplots(1, 4, figsize=(16, 4))
 
+                sps = transfer.modem.bit_duration
+                # 取 1000 个样点（而非 200），除以 bit_duration 后才有足够的符号点画出星座簇
                 plot_constellation(
-                    simulation_results["modulated_signal"][:200],
+                    simulation_results["modulated_signal"][:1000],
                     title="QPSK调制信号星座图", ax=ax1, modulation_type=modulation_type,
+                    samples_per_symbol=sps,
                 )
                 plot_constellation(
-                    simulation_results["noisy_signal"][:200],
+                    simulation_results["noisy_signal"][:1000],
                     title="QPSK加噪信号星座图", ax=ax2, modulation_type=modulation_type,
+                    samples_per_symbol=sps,
                 )
 
                 if len(simulation_results["modulated_signal"]) > 0:
@@ -322,8 +354,16 @@ def display_signal_visualization_enhanced(
                     ax4.legend()
                     ax4.grid(True, alpha=0.3)
 
+            else:
+                # 兜底分支：避免新增调制方式时 fig 未定义导致 UnboundLocalError
+                fig, ax_na = plt.subplots(figsize=(6, 4))
+                ax_na.text(0.5, 0.5, f"暂不支持的调制方式: {modulation_type}",
+                           ha="center", va="center", transform=ax_na.transAxes)
+                ax_na.set_axis_off()
+
             plt.tight_layout()
             st.pyplot(fig)
+            plt.close(fig)
 
             st.info("""
             **星座图分析说明:**
@@ -339,16 +379,26 @@ def display_signal_visualization_enhanced(
 
             fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(14, 10))
 
-            plot_spectrum(simulation_results["modulated_signal"][:2000], title="调制信号频谱", ax=ax1, fs=1000)
-            plot_spectrum(simulation_results["noisy_signal"][:2000], title="加噪信号频谱", ax=ax2, fs=1000)
+            fs = 1000
+            plot_spectrum(simulation_results["modulated_signal"][:2000], title="调制信号频谱", ax=ax1, fs=fs)
+            plot_spectrum(simulation_results["noisy_signal"][:2000], title="加噪信号频谱", ax=ax2, fs=fs)
 
-            fft_mod = np.fft.fft(simulation_results["modulated_signal"][:2000])
-            fft_noisy = np.fft.fft(simulation_results["noisy_signal"][:2000])
-            freq = np.fft.fftfreq(2000, 1 / 1000)
+            # FFT 长度必须动态取，不能写死 2000：
+            # 信号短于 1000 点时 x/y 长度不等会直接抛异常，
+            # 1000~2000 点之间虽然不崩，但 fftfreq 按 2000 算出来的横轴数值是错的
+            n_fft = min(
+                2000,
+                len(simulation_results["modulated_signal"]),
+                len(simulation_results["noisy_signal"]),
+            )
+            fft_mod = np.fft.fft(simulation_results["modulated_signal"][:n_fft])
+            fft_noisy = np.fft.fft(simulation_results["noisy_signal"][:n_fft])
+            freq = np.fft.fftfreq(n_fft, 1 / fs)
 
-            positive_freq = freq[:1000]
-            positive_fft_mod = np.abs(fft_mod[:1000])
-            positive_fft_noisy = np.abs(fft_noisy[:1000])
+            half = max(n_fft // 2, 1)
+            positive_freq = freq[:half]
+            positive_fft_mod = np.abs(fft_mod[:half])
+            positive_fft_noisy = np.abs(fft_noisy[:half])
 
             ax3.plot(positive_freq, 20 * np.log10(positive_fft_mod + 1e-10),
                      "b-", alpha=0.7, label="原始信号", linewidth=1)
@@ -359,20 +409,23 @@ def display_signal_visualization_enhanced(
             ax3.set_title("频谱对比")
             ax3.legend()
             ax3.grid(True, alpha=0.3)
-            ax3.set_xlim([0, 500])
+            ax3.set_xlim([0, fs / 2])
 
-            noise_estimate = positive_fft_noisy - positive_fft_mod
-            ax4.plot(positive_freq, 20 * np.log10(np.abs(noise_estimate) + 1e-10),
+            # 噪声谱要用复频谱相减再取模：两个模值相减不等于噪声的模（噪声有相位），
+            # 而且结果可能为负，取 abs 后波形完全失真
+            noise_estimate = np.abs(fft_noisy[:half] - fft_mod[:half])
+            ax4.plot(positive_freq, 20 * np.log10(noise_estimate + 1e-10),
                      "g-", alpha=0.7, label="估计噪声", linewidth=1)
             ax4.set_xlabel("频率 (Hz)")
             ax4.set_ylabel("噪声幅度 (dB)")
             ax4.set_title("噪声频谱估计")
             ax4.legend()
             ax4.grid(True, alpha=0.3)
-            ax4.set_xlim([0, 500])
+            ax4.set_xlim([0, fs / 2])
 
             plt.tight_layout()
             st.pyplot(fig)
+            plt.close(fig)
 
             st.info("""
             **频谱分析说明:**
@@ -410,6 +463,7 @@ def display_signal_visualization_enhanced(
 
             plt.tight_layout()
             st.pyplot(fig)
+            plt.close(fig)
 
             st.subheader("⏱️ 时域波形对比")
             fig2, (ax3, ax4, ax5) = plt.subplots(3, 1, figsize=(14, 10))
@@ -464,6 +518,7 @@ def display_signal_visualization_enhanced(
 
             plt.tight_layout()
             st.pyplot(fig2)
+            plt.close(fig2)
 
             st.info("""
             **综合视图分析说明:**
@@ -477,35 +532,62 @@ def display_signal_visualization_enhanced(
         # 比特错误可视化
         st.subheader("🔍 比特错误分析")
 
-        display_bits = min(50, len(simulation_results["original_bits"]), len(simulation_results["decoded_bits"]))
-        original_display = simulation_results["original_bits"][:display_bits]
-        simulated_display = simulation_results["decoded_bits"][:display_bits]
+        orig_all = np.asarray(simulation_results["original_bits"])
+        deco_all = np.asarray(simulation_results["decoded_bits"])
+        n_cmp = min(len(orig_all), len(deco_all))
+        orig_all, deco_all = orig_all[:n_cmp], deco_all[:n_cmp]
+
+        # 先在全量比特里找错误，再把观察窗对准第一个错误。
+        # 窗口死钉在开头时，高信噪比下前 50 比特几乎不会出错，
+        # 用户永远看到"无错误"，误以为对比功能没生效。
+        all_errors = np.flatnonzero(orig_all != deco_all)
+        window = min(50, n_cmp)
+        start = 0
+        if all_errors.size and n_cmp > window:
+            start = max(0, min(int(all_errors[0]) - window // 4, n_cmp - window))
+
+        display_bits = window
+        original_display = orig_all[start:start + window]
+        simulated_display = deco_all[start:start + window]
+
+        if all_errors.size:
+            st.caption(
+                f"全部 {n_cmp:,} 个对比比特中共有 {all_errors.size:,} 个错误"
+                f"（误码率 {all_errors.size / n_cmp:.6f}）；"
+                f"下图窗口已对准第一个错误（第 {int(all_errors[0]):,} 比特）"
+            )
+        else:
+            st.caption(f"全部 {n_cmp:,} 个对比比特中无错误；下图显示开头 {window} 比特")
 
         fig3, ax = plt.subplots(figsize=(15, 4))
-        x_pos = np.arange(display_bits)
+        x_pos = np.arange(start, start + window)
 
         error_positions = []
-        for i in range(display_bits):
+        for i in range(window):
             if original_display[i] != simulated_display[i]:
-                error_positions.append(i)
-                ax.axvspan(i - 0.4, i + 0.4, alpha=0.3, color="red")
+                error_positions.append(start + i)
+                ax.axvspan(start + i - 0.4, start + i + 0.4, alpha=0.3, color="red")
 
         ax.stem(x_pos, original_display, linefmt="b-", markerfmt="bo", basefmt=" ", label="原始比特")
         ax.stem(x_pos + 0.1, simulated_display, linefmt="r-", markerfmt="rx", basefmt=" ", label="模拟接收比特")
 
         ax.set_xlabel("比特位置")
         ax.set_ylabel("比特值")
-        ax.set_title(f"比特对比 (红色区域表示错误，共{len(error_positions)}个错误)")
+        ax.set_title(
+            f"比特对比：第 {start:,}~{start + window - 1:,} 比特"
+            f"（红色区域为错误，窗口内 {len(error_positions)} 个 / 全量 {all_errors.size:,} 个）"
+        )
         ax.set_ylim(-0.5, 1.5)
         ax.legend()
         ax.grid(True, alpha=0.3)
 
         st.pyplot(fig3)
+        plt.close(fig3)
 
         if error_positions:
-            st.write(f"**错误比特位置 (前{display_bits}比特中):** {error_positions}")
+            st.write(f"**错误比特位置 (第 {start:,}~{start + window - 1:,} 比特窗口内):** {error_positions}")
         else:
-            st.write(f"**错误比特位置:** 前{display_bits}比特中无错误")
+            st.write(f"**错误比特位置:** 第 {start:,}~{start + window - 1:,} 比特窗口内无错误")
 
     except Exception as e:
         import traceback
@@ -660,6 +742,11 @@ def main() -> None:
         transfer.modem.coding_rate = 4 / 7
     else:
         transfer.modem.coding_rate = 1
+
+    # 把侧边栏的选择同步到 modem，使「从 .dat 恢复且无元数据」时的兜底值
+    # 至少跟用户当前的界面设置一致，而不是永远的 BPSK / 10dB
+    transfer.modem.modulation_type = modulation_type
+    transfer.modem.snr_db = snr_db
 
     tab1, tab2, tab3 = st.tabs(["📤 发送文件", "📥 接收文件", "📊 误码率分析"])
 
@@ -935,7 +1022,9 @@ def main() -> None:
                 st.write(f"**编码方案**: {results['coding_scheme']}")
                 st.write(f"**编码效率**: {results['coding_rate']:.3f}")
                 st.write(f"**设定信噪比**: {results['snr_db']} dB")
-                st.write(f"**实际信噪比**: {results.get('actual_snr', 'N/A'):.2f} dB")
+                _snr = results.get("actual_snr")
+                _snr_ok = isinstance(_snr, (int, float)) and np.isfinite(_snr)
+                st.write(f"**实际信噪比**: {f'{_snr:.2f} dB' if _snr_ok else 'N/A'}")
 
             st.subheader("⚡ 本次传输性能")
             analyzed_bytes = results.get("analyzed_bytes")
@@ -943,10 +1032,14 @@ def main() -> None:
             duration = results.get("duration")
             speed = results.get("speed")
             retransmissions = results.get("retransmissions")
+            retransmitted_chunks = results.get("retransmitted_chunks")
             total_chunks = results.get("total_chunks")
             recv_completion = results.get("recv_completion_ratio")
             recv_missing = results.get("recv_missing_chunks")
-            sent_loss = (retransmissions / total_chunks * 100) if (retransmissions is not None and total_chunks) else None
+            # 丢包率 = 发生过重传的「块数」/ 总块数（同一块重传多次只算一次丢包）
+            sent_loss = (retransmitted_chunks / total_chunks * 100) if (retransmitted_chunks is not None and total_chunks) else None
+            # 重传率 = 总重传「次数」/ 总块数，同一块重传多次会累计，可能超过 100%
+            retrans_rate = (retransmissions / total_chunks * 100) if (retransmissions is not None and total_chunks) else None
             recv_loss = (recv_missing / total_chunks * 100) if (recv_missing is not None and total_chunks) else None
 
             col_perf1, col_perf2, col_perf3 = st.columns(3)
@@ -959,11 +1052,19 @@ def main() -> None:
                 st.metric("重传次数", f"{retransmissions}" if retransmissions is not None else "N/A")
             with col_perf3:
                 st.metric("发送端丢包率", f"{sent_loss:.2f}%" if sent_loss is not None else "N/A",
-                          help="重传次数 / 总块数（近似）")
+                          help="发生过重传的块数 / 总块数")
+                st.metric("发送端重传率", f"{retrans_rate:.2f}%" if retrans_rate is not None else "N/A",
+                          help="总重传次数 / 总块数；同一块重传多次会累计，可能超过 100%")
                 st.metric("接收端丢包率", f"{recv_loss:.2f}%" if recv_loss is not None else "N/A",
                           help="缺失块数 / 总块数")
             if recv_completion is not None:
-                st.caption(f"接收端完整度：{recv_completion:.1%}（收到 {int(recv_completion * (total_chunks or 0))}/{total_chunks} 块）")
+                if total_chunks:
+                    st.caption(
+                        f"接收端完整度：{recv_completion:.1%}"
+                        f"（收到 {int(recv_completion * total_chunks)}/{total_chunks} 块）"
+                    )
+                else:
+                    st.caption(f"接收端完整度：{recv_completion:.1%}（总块数未知）")
 
             st.subheader("🎯 误码率对比分析")
             col_ber1, col_ber2 = st.columns(2)
@@ -1040,12 +1141,14 @@ def main() -> None:
             with col_power1:
                 st.write(f"**信号功率**: {results.get('signal_power', 0):.6f}")
                 st.write(f"**噪声功率**: {results.get('noise_power', 0):.6f}")
+            actual_snr = results.get("actual_snr")
+            actual_snr_ok = isinstance(actual_snr, (int, float)) and np.isfinite(actual_snr)
             with col_power2:
                 st.write(f"**设定信噪比**: {results['snr_db']} dB")
-                st.write(f"**实际信噪比**: {results.get('actual_snr', 'N/A'):.2f} dB")
+                st.write(f"**实际信噪比**: {f'{actual_snr:.2f} dB' if actual_snr_ok else 'N/A'}")
             with col_power3:
-                if "actual_snr" in results:
-                    snr_error = results["actual_snr"] - results["snr_db"]
+                if actual_snr_ok:
+                    snr_error = actual_snr - results["snr_db"]
                     st.write(f"**信噪比误差**: {snr_error:.2f} dB")
                     if abs(snr_error) < 0.5:
                         st.success("✅ 信噪比控制精确")
@@ -1053,6 +1156,9 @@ def main() -> None:
                         st.info("ℹ️ 信噪比控制良好")
                     else:
                         st.warning("⚠️ 信噪比控制有偏差")
+                else:
+                    st.write("**信噪比误差**: N/A")
+                    st.info("ℹ️ 实际信噪比不可用（噪声功率为 0 或数据缺失）")
 
             st.subheader("🔍 数据样本对比")
             col_sample1, col_sample2, col_sample3 = st.columns(3)
@@ -1126,22 +1232,30 @@ def main() -> None:
                 ber_values = [results["simulated_ber"]]
                 colors = ["#FF6B6B"]
 
-            bars = ax.bar(categories, ber_values, color=colors, alpha=0.7, edgecolor="black")
+            # 对数坐标画不出 0（log(0) = -inf），给 0 值一个可见的地板高度，
+            # 否则"实际传输 BER = 0"这根柱子会整根消失，看着像图没画出来
+            use_log = max(ber_values) > 0
+            positive = [v for v in ber_values if v > 0]
+            floor = (min(positive) / 100) if (use_log and positive) else 1e-10
+            plot_values = [(v if v > 0 else floor) for v in ber_values] if use_log else ber_values
+
+            bars = ax.bar(categories, plot_values, color=colors, alpha=0.7, edgecolor="black")
             for bar, value in zip(bars, ber_values):
-                height = bar.get_height()
-                display_text = "0.000000" if value == 0 else f"{value:.8f}"
-                ax.text(bar.get_x() + bar.get_width() / 2.0, height + 0.0001,
+                display_text = "0（无误码）" if value == 0 else f"{value:.8f}"
+                ax.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height(),
                         display_text, ha="center", va="bottom", fontweight="bold")
 
             ax.set_ylabel("误码率 (BER)")
             ax.set_title("实际传输 vs 模拟信道误码率对比")
             ax.grid(True, alpha=0.3)
 
-            if max(ber_values) > 0:
+            if use_log:
                 ax.set_yscale("log")
-                ax.set_ylabel("误码率 (BER) - 对数坐标")
+                ax.set_ylim(bottom=floor / 10)
+                ax.set_ylabel("误码率 (BER) - 对数坐标，0 值以图示最低高度表示")
 
             st.pyplot(fig)
+            plt.close(fig)
 
             st.subheader("💡 系统优化建议")
             if results["simulated_ber"] > 0.01:
@@ -1195,7 +1309,7 @@ def main() -> None:
             ### 关于实际传输误码率的说明：
 
             **实际传输误码率计算方式:**
-            - 🔄 **比特对比**: 对比发送和接收的前1000字节数据
+            - 🔄 **比特对比**: 对比发送和接收的数据（范围由侧边栏「分析采样大小」决定，默认前 64KB）
             - ✅ **错误检测**: 统计不一致的比特数量
             - 📊 **误码率计算**: 错误比特数 / 总对比比特数
             - 🛡️ **可靠传输**: 由于重传机制，通常误码率为0

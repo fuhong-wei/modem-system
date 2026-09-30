@@ -1,6 +1,6 @@
 """调制解调与信道模拟模块（纯逻辑，不依赖 UI）。"""
 
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 
@@ -23,58 +23,70 @@ class ModemSystem:
             symbols = np.where(bits, -1, 1)
             return np.repeat(symbols, self.bit_duration)
         if modulation_type == "QPSK":
-            modulated = np.array([], dtype=complex)
-            for i in range(0, len(bits) - 1, 2):
-                dibit = (bits[i], bits[i + 1])
-                if dibit == (0, 0):
-                    symbol = complex(1, 1)
-                elif dibit == (0, 1):
-                    symbol = complex(-1, 1)
-                elif dibit == (1, 0):
-                    symbol = complex(-1, -1)
-                else:
-                    symbol = complex(1, -1)
-                symbol /= np.sqrt(2)
-                modulated = np.append(modulated, [symbol] * self.bit_duration)
-            return modulated
+            bit_array = np.asarray(bits, dtype=np.uint8)
+            # QPSK 两比特一符号，丢掉落单的最后一个比特（与原逻辑 range(0, len-1, 2) 一致）
+            bit_array = bit_array[: len(bit_array) // 2 * 2]
+            if bit_array.size == 0:
+                return np.array([], dtype=complex)
+            dibits = bit_array.reshape(-1, 2)
+            # 索引 = b0*2 + b1，顺序与原映射一致：00->1+1j, 01->-1+1j, 10->-1-1j, 11->1-1j
+            idx = dibits[:, 0].astype(np.intp) * 2 + dibits[:, 1].astype(np.intp)
+            table = np.array([1 + 1j, -1 + 1j, -1 - 1j, 1 - 1j], dtype=complex) / np.sqrt(2)
+            return np.repeat(table[idx], self.bit_duration)
         return np.array([])
 
     def demodulate(self, received_signal, modulation_type: str = "BPSK") -> List[int]:
-        """基带符号序列 -> 比特流。"""
-        bits: List[int] = []
+        """基带符号序列 -> 比特流（向量化，避免逐符号 Python 循环）。"""
+        raw = np.asarray(received_signal)
+        if raw.size == 0:
+            return []
+        sig = raw.astype(complex) if np.iscomplexobj(raw) else raw.astype(float)
+
+        d = self.bit_duration
+        n_full = sig.size // d
+        # 按 bit_duration 分组求均值；不足一组的尾部单独平均（与原循环行为一致）
+        parts = []
+        if n_full:
+            parts.append(sig[: n_full * d].reshape(n_full, d).mean(axis=1))
+        tail = sig[n_full * d:]
+        if tail.size:
+            parts.append(np.array([tail.mean()], dtype=sig.dtype))
+        symbol_avgs = np.concatenate(parts) if parts else np.array([], dtype=sig.dtype)
+
         if modulation_type == "BPSK":
-            for i in range(0, len(received_signal), self.bit_duration):
-                end_idx = min(i + self.bit_duration, len(received_signal))
-                symbol_avg = np.mean(received_signal[i:end_idx])
-                bits.append(1 if symbol_avg < 0 else 0)
-        elif modulation_type == "QPSK":
-            for i in range(0, len(received_signal), self.bit_duration):
-                end_idx = min(i + self.bit_duration, len(received_signal))
-                symbol_avg = np.mean(received_signal[i:end_idx])
-                real_part = np.real(symbol_avg)
-                imag_part = np.imag(symbol_avg)
-                if real_part >= 0 and imag_part >= 0:
-                    bits.extend([0, 0])
-                elif real_part < 0 and imag_part >= 0:
-                    bits.extend([0, 1])
-                elif real_part < 0 and imag_part < 0:
-                    bits.extend([1, 0])
-                else:
-                    bits.extend([1, 1])
-        return bits
+            return (np.real(symbol_avgs) < 0).astype(np.uint8).tolist()
+
+        if modulation_type == "QPSK":
+            i_neg = np.real(symbol_avgs) < 0
+            q_neg = np.imag(symbol_avgs) < 0
+            # 与原 if/elif 判决表等价：
+            # (I>=0,Q>=0)->00  (I<0,Q>=0)->01  (I<0,Q<0)->10  (I>=0,Q<0)->11
+            # 即 bit0 = (Q<0)，bit1 = (I<0) XOR (Q<0)
+            out = np.empty(symbol_avgs.size * 2, dtype=np.uint8)
+            out[0::2] = q_neg
+            out[1::2] = i_neg ^ q_neg
+            return out.tolist()
+
+        return []
 
     # ---------- 信道 ----------
-    def add_noise(self, signal_data, snr_db) -> np.ndarray:
-        """按给定信噪比（dB）叠加高斯白噪声。"""
+    def add_noise(self, signal_data, snr_db, rng=None) -> np.ndarray:
+        """按给定信噪比（dB）叠加高斯白噪声。
+
+        ``rng`` 为可选的 numpy Generator。不传则新建一个独立生成器，
+        不再像 ``np.random.randn`` 那样污染全局随机状态。
+        """
+        generator = rng if rng is not None else np.random.default_rng()
         signal_power = self._signal_power(signal_data)
         noise_power = signal_power / (10 ** (snr_db / 10.0))
+        n = len(signal_data)
 
         if np.iscomplexobj(signal_data):
             noise = np.sqrt(noise_power / 2) * (
-                np.random.randn(len(signal_data)) + 1j * np.random.randn(len(signal_data))
+                generator.standard_normal(n) + 1j * generator.standard_normal(n)
             )
         else:
-            noise = np.sqrt(noise_power) * np.random.randn(len(signal_data))
+            noise = np.sqrt(noise_power) * generator.standard_normal(n)
 
         return signal_data + noise
 
@@ -94,13 +106,16 @@ class ModemSystem:
         modulation_type: str,
         coding_scheme: str,
         snr_db,
-        seed: int = 42,
+        seed: Optional[int] = 42,
     ) -> dict:
         """完整信道模拟：编码 -> 调制 -> 加噪 -> 解调 -> 解码。
 
         返回结果字典，其中 ``steps`` 为供 UI 展示的过程说明。
+
+        ``seed`` 传 int 则结果可复现，传 None 则每次噪声都不同。
+        用局部 Generator 而不是 ``np.random.seed``，避免污染全局随机状态。
         """
-        np.random.seed(seed)
+        rng = np.random.default_rng(seed)
 
         steps: List[str] = []
 
@@ -123,7 +138,7 @@ class ModemSystem:
         steps.append(f"- 信噪比: {snr_db} dB (线性: {snr_linear:.3f})")
         steps.append(f"- 理论噪声功率: {noise_power:.6f}")
 
-        noisy_signal = self.add_noise(modulated_signal, snr_db)
+        noisy_signal = self.add_noise(modulated_signal, snr_db, rng=rng)
         actual_noise_power = self._signal_power(noisy_signal - modulated_signal)
         actual_snr = 10 * np.log10(signal_power / actual_noise_power) if actual_noise_power > 0 else float("inf")
         steps.append(f"- 实际噪声功率: {actual_noise_power:.6f}")

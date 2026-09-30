@@ -1,5 +1,7 @@
 """可靠 UDP 传输的纯逻辑单元测试。"""
 
+import numpy as np
+
 from src.transport import ReliableUDPTransfer
 
 
@@ -11,7 +13,8 @@ class TestBitByteConversion:
 
     def test_known_bits(self):
         transfer = ReliableUDPTransfer()
-        assert transfer.bytes_to_bits(b"\x01") == [0, 0, 0, 0, 0, 0, 0, 1]
+        # bytes_to_bits 现在返回 np.ndarray（避免大文件把内存撑爆）
+        assert np.array_equal(transfer.bytes_to_bits(b"\x01"), [0, 0, 0, 0, 0, 0, 0, 1])
 
     def test_empty(self):
         transfer = ReliableUDPTransfer()
